@@ -1,0 +1,51 @@
+# 第 7 步：Docker 一键部署。三个服务：
+#   redis    —— 会话元数据（独立容器，backend 通过 REDIS_HOST=redis 连）
+#   backend  —— FastAPI(8000)：Agent-RAG 核心
+#   frontend —— Streamlit(8501)：网页，BACKEND_URL=http://backend:8000 调后端
+services:
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    volumes:
+      - redis_data:/data            # Redis 数据持久化
+    healthcheck:                    # 后端等它健康了才启动，避免连不上
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  backend:
+    build:
+      context: .
+      dockerfile: docker/backend.Dockerfile
+    restart: unless-stopped
+    env_file: .env                  # secrets 运行期注入，不打进镜像
+    environment:
+      - REDIS_HOST=redis            # 覆盖 session_store.py 默认的 localhost
+      - HF_HOME=/hf_cache           # 模型缓存指向挂载的 D 盘
+      - HF_HUB_DISABLE_SYMLINKS_WARNING=1
+      - HF_HUB_OFFLINE=1            # 模型全走本地缓存，禁联网检查（容器内 HF 被墙 + hub client 已关会报错）
+    volumes:
+      - ./faiss_db:/app/faiss_db                     # 会话索引持久化（上传建好的库）
+      - ./checkpoints.sqlite:/app/checkpoints.sqlite  # 对话记忆（SqliteSaver）
+      - /mnt/d/AI_CACHE/huggingface:/hf_cache         # 复用 D 盘已下载的模型，不重复下载
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend.Dockerfile
+    restart: unless-stopped
+    environment:
+      - BACKEND_URL=http://backend:8000   # compose 服务名在容器网络里就是域名
+    ports:
+      - "8501:8501"
+    depends_on:
+      - backend
+
+volumes:
+  redis_data:

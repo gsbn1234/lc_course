@@ -1,0 +1,16 @@
+# 构建上下文排除项：这些文件不发给 Docker 守护进程。
+# 最关键：.venv 5GB+，不排除每次 build 都往 daemon 传 5GB
+.venv
+__pycache__
+*.pyc
+.git
+.idea
+.env
+.pytest_cache
+faiss_db
+checkpoints.sqlite
+docs
+tests
+app
+*.md
+*.pdf

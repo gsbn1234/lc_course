@@ -1,0 +1,167 @@
+"""
+Streamlit 前端 — 前后端分离版。
+
+演进变化：
+  原版：Streamlit 直接调 build_multi_agent_graph → graph.stream()
+  现在：Streamlit 调 FastAPI → API 跑 Agent → SSE 流式返回 → 前端解析渲染
+
+架构：Streamlit(8501) ↔ HTTP/SSE ↔ FastAPI(8000) ↔ LangGraph Agent
+"""
+
+import os
+import requests #Python 最常用 HTTP 请求库，用来调用 FastAPI 接口，上传文件、发起对话、接收流式返回；
+import json
+import streamlit as st #`streamlit as st`：网页 UI 框架。
+
+# 本地开发默认 127.0.0.1:8000；Docker 里 compose 注入 BACKEND_URL=http://backend:8000
+BACKEND = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
+
+st.set_page_config(page_title="Adaptive Research Agent")
+
+# ========== 1. 初始化 session_state ==========
+if "initialized" not in st.session_state:
+    st.session_state.session_id = None
+    st.session_state.messages = []
+    st.session_state.initialized = True
+
+# ========== 2. 侧边栏：上传 PDF + 参数配置 ==========
+with st.sidebar:
+    st.header("📄 知识库")
+    #技术点：st.file_uploader — Streamlit 把用户上传的文件包装成 UploadedFile 对象，存在内存里，此时文件还没离开浏览器所在机器
+    uploaded_files = st.file_uploader(
+        "上传 PDF 文件",
+        type="pdf",
+        accept_multiple_files=True,
+        help="支持同时上传多个 PDF，上传后点击「构建索引」",
+    )
+
+    st.header("⚙️ 参数")
+    max_rounds = st.slider("最大搜索轮数", 1, 10, 5)
+
+    if st.button("🔄 构建/重建索引", use_container_width=True):#按钮组件；`use_container_width=True` = 按钮宽度铺满侧边栏。
+        if not uploaded_files:
+            st.warning("请先上传 PDF 文件")
+        else:
+            with st.spinner("正在上传 PDF 并构建索引..."):
+                # 构建上传请求 → 发到 FastAPI
+#                 """
+#                  requests 上传文件标准格式
+# 上传文件时 post 请求需要构造 files 参数：
+# `(表单字段名, (文件名, 文件二进制, MIME类型))`
+# - 表单 key 统一叫 `files`，后端 FastAPI 接收`List[UploadFile]`
+# - `f.getvalue()` 读取 pdf 二进制字节，不会写入本地磁盘，直接内存上传后端。
+#                 """
+                files = []
+                for f in uploaded_files:
+                    files.append(
+                        ("files", (f.name, f.getvalue(), "application/pdf"))
+                    )
+
+                try:
+                    resp = requests.post(
+                        f"{BACKEND}/api/upload-pdf",
+                        files=files,
+                    )
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        st.session_state.session_id = data["session_id"]
+                        st.session_state.messages = []  # 新知识库，清空历史对话
+                        st.success(
+                            f"索引构建完成！{data['child_chunks']} 个 child chunk，"
+                            f"{data['parent_chunks']} 个 parent chunk"
+                        )
+                    else:
+                        st.error(f"后端错误：{resp.text}")
+                except requests.exceptions.ConnectionError:
+                    st.error("无法连接后端，请先启动 FastAPI：uvicorn streamlit_1.backend:app --port 8000 --reload")
+
+    # 显示当前状态
+    if st.session_state.session_id:
+        st.info(f"✅ 索引已就绪（会话: {st.session_state.session_id}）")
+    else:
+        st.warning("⚠️ 请上传 PDF 并构建索引")
+
+# ========== 3. 主区域 ==========
+st.title("Adaptive Research Agent")
+st.caption("Multi-Agent 协作检索系统 — Supervisor + Researcher + Writer")
+
+# 渲染历史消息
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.write(msg["content"])
+
+# ========== 4. 用户输入 ==========
+prompt = st.chat_input("输入你的问题，Agent 会自动搜索本地库和互联网...")
+
+if prompt:
+    if not st.session_state.session_id:
+        st.warning("请先在侧边栏上传 PDF 并点击「构建索引」")
+    else:
+        # 用户消息
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+
+        # 调用 FastAPI 流式对话
+        with st.chat_message("assistant"):
+            status_container = st.empty()
+            answer_container = st.empty()
+
+            tool_logs = []
+            answer = ""
+
+            try:
+                resp = requests.post(
+                    f"{BACKEND}/api/chat-stream",
+                    json={
+                        "session_id": st.session_state.session_id,
+                        "question": prompt,
+                        "max_tool_rounds": max_rounds,
+                    },
+                    stream=True,
+                    timeout=120,
+                )
+
+                if resp.status_code == 200:
+                    for line in resp.iter_lines(): #`resp.iter_lines()` 逐行读取 SSE 字节流。
+                        if not line:
+                            continue  #跳过数据流里面的空行，SSE 协议经常有空行作为分隔。
+                        line = line.decode() #bytes 字节 → utf‑8 字符串。
+                        if not line.startswith("data: "):
+                            continue #SSE 协议标准格式：后端每一条推送消息固定前缀 `data:`不是该格式的行全部跳过。
+                        data = json.loads(line[6:]) #切掉前缀`data: `（6 个字符），剩下字符串解析成 json 字典。
+
+                        event_type = data.get("type")
+                        if event_type == "status":
+                            agent = data.get("agent")
+                            if agent == "researcher":
+                                status_container.info(
+                                    f"🔍 Researcher 第 {data.get('rounds', '?')} 轮搜索中..."
+                                )
+                            elif agent == "writer":
+                                status_container.info("✍️ Writer 正在撰写答案...")
+                        elif event_type == "tool_call":
+                            tool_logs.append(
+                                f"🔧 {data['name']}({data['args']})"
+                            )
+                        elif event_type == "done":
+                            status_container.empty()
+                            answer = data["answer"]
+                            st.write(answer)
+                        elif event_type == "error":
+                            status_container.empty()
+                            st.error(f"后端处理出错：{data.get('message', '未知错误')}")
+                else:
+                    st.error(f"后端错误：{resp.text}")
+            except requests.exceptions.ChunkedEncodingError:
+                st.error("后端响应中途中断，请查看 uvicorn 终端的报错")
+            except requests.exceptions.ConnectionError:
+                st.error("无法连接后端，请先启动 FastAPI")
+
+        if answer:
+            st.session_state.messages.append({"role": "assistant", "content": answer})
+
+        if tool_logs:
+            with st.expander("🔍 查看检索过程"):
+                for log in tool_logs:
+                    st.text(log)
