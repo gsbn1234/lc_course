@@ -93,7 +93,6 @@ lc_course/
 │   ├── router_graph.py        #   Query Routing RAG 图（local/web）
 │   ├── multi_agent_graph.py   #   多 Agent 协作图（Supervisor/Researcher/Writer/Reviewer）
 │   └── llm.py                 #   DeepSeek 实例
-├── app/agents/personal_chief.py   # LangGraph CLI 单 Agent（私人厨师，可联网）
 ├── streamlit_1/
 │   ├── backend.py             # FastAPI 后端（上传 / 流式对话 / 健康检查）
 │   └── app.py                 # Streamlit 前端
@@ -167,11 +166,6 @@ uvicorn streamlit_1.backend:app --port 8000 --reload
 streamlit run streamlit_1/app.py
 ```
 浏览器打开 `http://localhost:8501`，上传 PDF → 构建索引 → 提问。
-
-**方式 C：LangGraph CLI 单 Agent**
-```bash
-langgraph dev   # 或按 langgraph.json 配置启动
-```
 
 ### 5. 跑评估
 
