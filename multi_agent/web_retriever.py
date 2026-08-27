@@ -18,12 +18,26 @@ def web_search(question, k=5):
         [{"doc": Document, "score": float}, ...]
         和 parent_hybrid_retrieve() 返回值结构完全一致
     """
-    tool = TavilySearchResults(max_results=k)    #工具本身能力：联网搜索，返回每条网页的正文摘要、url、标题等原始字典信息。
-    raw_results = tool.invoke({"query": question})  #raw_results：Tavily 原始返回值，列表。列表内每个元素是原生字典，结构固定
-                        #[  {"content": "网页摘要文本", "url": "网页链接", "title": "网页标题", ...} , ... ]。此时是原生字典，没有 Document、没有 score，必须手动包装。
+    tool = TavilySearchResults(max_results=k)
+    raw_results = tool.invoke({"query": question})
+
+    # 兼容 Tavily 的几种返回形态：
+    #   list[dict]         正常（每条 {"content","url","title","score"}）
+    #   dict               某些版本返回 {"results": [...]}
+    #   str                Tavily 出错时 _run 会把异常 repr 成字符串返回
+    #                      （见 langchain_community 的 TavilySearchResults._run），
+    #                      也偶有 JSON 文本。此时联网失败，返回空让上游走本地检索兜底。
+    if isinstance(raw_results, str):
+        print(f"\n[Web Search] Tavily 返回异常（{raw_results[:100]}），本次联网检索降级为空")
+        return []
+    if isinstance(raw_results, dict):
+        raw_results = raw_results.get("results", [])
+
     docs = []
     for r in raw_results:
-        # Tavily 返回 {"content": "...", "url": "...", ...}
+        # 极端兜底：个别条目不是 dict 也跳过，绝不崩在 .get 上
+        if not isinstance(r, dict):
+            continue
         content = r.get("content", "")
         url = r.get("url", "")
 
