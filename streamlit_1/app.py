@@ -16,6 +16,16 @@ import streamlit as st #`streamlit as st`：网页 UI 框架。
 # 本地开发默认 127.0.0.1:8000；Docker 里 compose 注入 BACKEND_URL=http://backend:8000
 BACKEND = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
+# 领域代码 → 中文名（下拉框和上传成功提示共用这一份，只改这里）
+# 注意：后端 mcp_tools/registry.py 里也有一份 DOMAIN_LABELS（它给 registry 用），
+# 两侧各自维护，增领域时记得两边同步。
+DOMAIN_MAP = {
+    "ai_learning": "AI 学习",
+    "general": "通用",
+    "finance": "金融",
+    "medical": "医疗",
+}
+
 st.set_page_config(page_title="Adaptive Research Agent")
 
 # ========== 1. 初始化 session_state ==========
@@ -39,12 +49,7 @@ with st.sidebar:
     domain = st.selectbox(
         "知识库领域",
         options=["ai_learning", "general", "finance", "medical"],
-        format_func=lambda d: {
-            "ai_learning": "AI 学习（技术文档）",
-            "general": "通用",
-            "finance": "金融（预留）",
-            "medical": "医疗（预留）",
-        }[d],
+        format_func=lambda d: DOMAIN_MAP[d],
         help="选择上传 PDF 所属领域。AI 学习领域会为 Researcher 挂上 "
              "GitHub / arXiv / HuggingFace 三个真实检索工具",
     )
@@ -81,12 +86,8 @@ with st.sidebar:
                         data = resp.json()
                         st.session_state.session_id = data["session_id"]
                         st.session_state.messages = []  # 新知识库，清空历史对话
-                        domain_name = {
-                            "ai_learning": "AI 学习",
-                            "general": "通用",
-                            "finance": "金融",
-                            "medical": "医疗",
-                        }.get(data.get("domain", ""), data.get("domain", ""))
+                        raw_domain = data.get("domain", "")
+                        domain_name = DOMAIN_MAP.get(raw_domain, raw_domain)
                         st.success(
                             f"索引构建完成！{data['child_chunks']} 个 child chunk，"
                             f"{data['parent_chunks']} 个 parent chunk"
