@@ -195,15 +195,18 @@ async def _get_mcp_ctx():
                 "mcp_tools", "my_mcp_server.py",
             )
             connection = {
-                "transport": "stdio",
+                "transport": "stdio",          #通信模式，标准输入输出子进程通信
                 "command": sys.executable,   # 用 .venv 的 python，保证子进程有 mcp 包
                 "args": [server_path],       # 绝对路径，在哪启动 uvicorn 都不怕
             }
             cm = create_session(connection)          # 手动持有 async context manager
-            session = await cm.__aenter__()
+            session = await cm.__aenter__()            #正式拉起 MCP Server 子进程
             await session.initialize()               # 必须先初始化才能收发请求
             _mcp_ctx = {"session": session, "connection": connection, "cm": cm}
-    return _mcp_ctx
+            #`session`：MCP 会话对象（最核心，传给`load_mcp_tools(session=session)`实现连接复用）
+            #`connection`：连接配置（备用）
+            #`cm`：上下文管理器对象，**关闭服务时必须依靠 cm 调用`__aexit__`，杀掉 MCP 子进程**。
+    return _mcp_ctx #初始化完成，返回全局 MCP 上下文字典。
 
 
 async def close_mcp():
@@ -233,17 +236,19 @@ async def load_mcp_tools(domain: str = "general"):
         # 白名单过滤，先于启动子进程：没有工具就根本不用连 MCP
         from mcp_tools.registry import get_domain_tools
 
-        whitelist = get_domain_tools(domain)
+        whitelist = get_domain_tools(domain)#根据领域名称取出工具白名单列表。
         if not whitelist:
             return []
 
         ctx = await _get_mcp_ctx()
-        from langchain_mcp_adapters.client import load_mcp_tools as _load_from_session
+        from langchain_mcp_adapters.client import load_mcp_tools as _load_from_session #导入适配器加载函数，起别名
 
         tools = await _load_from_session(
             ctx["session"], connection=ctx["connection"], server_name="mytools"
         )
-        return [t for t in tools if t.name in whitelist]
+        filtered = [t for t in tools if t.name in whitelist]#列表推导式做白名单过滤
+        print(f"[MCP] 领域 {domain} → 已加载 {len(filtered)} 个工具: {[t.name for t in filtered]}")
+        return filtered
     except Exception as e:
         print(f"[MCP] 加载 MCP 工具失败，已跳过：{e}")
         return []   # MCP 挂了不影响 RAG 主流程
@@ -286,7 +291,23 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
             store.put(("users", user_id), "style", {"data": pref})
             print(f"\n[Memory] 已记住用户偏好：{pref}")
 
-    researcher_system = SystemMessage(content="""你是一个专职的信息研究员。
+    # MCP 领域工具引导：把挂载的专业工具写进提示词，Researcher 才会主动去用
+    # （光 bind_tools 不够——提示词里只点名 local_search/internet_search 时，
+    #   LLM 会一直优先用那两个，专业工具形同虚设）
+    mcp_tool_guide = ""
+    if extra_tools:
+        lines = []
+        for t in extra_tools:
+            desc = (t.description or "专业检索工具").splitlines()[0][:60]
+            lines.append(f"  {t.name}：{desc}")
+        mcp_tool_guide = (
+            f"\n- 你还有 {len(extra_tools)} 个专业检索工具（按需使用）：\n"
+            + "\n".join(lines)
+            + "\n- 当问题涉及开源项目选型、学术论文、模型选型等方向时，"
+              "优先用对应的专业工具，而不是只靠网页搜索。"
+        )
+
+    researcher_system = SystemMessage(content=f"""你是一个专职的信息研究员。
 你的唯一任务：根据 Supervisor 给你的搜索指令，调用搜索工具获取信息。
 
 工作原则：
@@ -296,7 +317,7 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
 - 你可以一次调用多个工具来覆盖不同角度的信息。
 - 当你认为搜索已经足够，不要自己回答用户——把你的搜索结果
   以「研究材料」的形式整理好，等待 Writer 接手。
-
+{mcp_tool_guide}
 记住：你只管"找到什么"，不管"怎么说"。""")
 
     researcher_human = HumanMessage(
@@ -304,7 +325,9 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
                 f"用户原始问题：{question}\n\n"
                 f"搜索参考方向：{rewritten}\n\n"
                 f"请先搜索本地知识库（技术概念和原理），如果本地信息不够或涉及实时信息，"
-                f"再搜互联网。搜完后整理好材料，等待 Writer 接手。"
+                f"再搜互联网。"
+                f"{'如有开源项目、论文、模型选型相关需求，优先用对应的专业检索工具。' if extra_tools else ''}"
+                f"搜完后整理好材料，等待 Writer 接手。"
     )
 
     return {
