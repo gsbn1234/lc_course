@@ -35,6 +35,20 @@ with st.sidebar:
         help="支持同时上传多个 PDF，上传后点击「构建索引」",
     )
 
+    # 知识库领域：决定 Researcher 挂哪些 MCP 工具（见 mcp_tools/registry.py）
+    domain = st.selectbox(
+        "知识库领域",
+        options=["ai_learning", "general", "finance", "medical"],
+        format_func=lambda d: {
+            "ai_learning": "AI 学习（技术文档）",
+            "general": "通用",
+            "finance": "金融（预留）",
+            "medical": "医疗（预留）",
+        }[d],
+        help="选择上传 PDF 所属领域。AI 学习领域会为 Researcher 挂上 "
+             "GitHub / arXiv / HuggingFace 三个真实检索工具",
+    )
+
     st.header("⚙️ 参数")
     max_rounds = st.slider("最大搜索轮数", 1, 10, 5)
 
@@ -61,14 +75,22 @@ with st.sidebar:
                     resp = requests.post(
                         f"{BACKEND}/api/upload-pdf",
                         files=files,
+                        data={"domain": domain},   # 领域：决定挂哪些 MCP 工具
                     )
                     if resp.status_code == 200:
                         data = resp.json()
                         st.session_state.session_id = data["session_id"]
                         st.session_state.messages = []  # 新知识库，清空历史对话
+                        domain_name = {
+                            "ai_learning": "AI 学习",
+                            "general": "通用",
+                            "finance": "金融",
+                            "medical": "医疗",
+                        }.get(data.get("domain", ""), data.get("domain", ""))
                         st.success(
                             f"索引构建完成！{data['child_chunks']} 个 child chunk，"
                             f"{data['parent_chunks']} 个 parent chunk"
+                            f"（领域：{domain_name}）"
                         )
                     else:
                         st.error(f"后端错误：{resp.text}")

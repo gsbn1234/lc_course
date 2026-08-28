@@ -23,6 +23,7 @@ Multi-Agent 协作系统 — Supervisor + Researcher + Writer。
 """
 import os
 import sys
+import asyncio
 from typing import TypedDict, Annotated, Literal
 import operator
 
@@ -159,25 +160,90 @@ def make_search_tools(vector_store, bm25, chunks, parent_docs, extra_tools=None)
     # return [local_search, internet_search]
 
 
-async def load_mcp_tools():
-    """把 MCP 服务器暴露的工具转成 LangChain 工具。"""
-    try:
-        from langchain_mcp_adapters.client import MultiServerMCPClient
+# ========== MCP 客户端全局复用 ==========
+# 企业级要点：客户端进程全局只起一次，所有会话共享。
+# 之前每个会话（每次上传 PDF / 会话恢复）都新建 MultiServerMCPClient，
+# 等于每个用户都 fork 一个 Python 子进程 —— 100 个会话就 100 个进程。
+_mcp_ctx = None                # 全局唯一的 MCP 上下文（client + session + connection）
+_mcp_ctx_lock = asyncio.Lock()  # 并发下只初始化一次
 
-        # 关键：文件在 multi_agent/ 目录，往上一级才是项目根，再进 mcp/
-        server_path = os.path.join(
-            os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-            "mcp", "my_mcp_server.py",
-        )
 
-        client = MultiServerMCPClient({
-            "mytools": {
+async def _get_mcp_ctx():
+    """
+    返回全局唯一的 MCP 上下文，含一个常驻 ClientSession（= 一个 stdio 子进程）。
+
+    langchain-mcp-adapters 0.1.0 之后，get_tools() 每次调用都会临时 create_session
+    起新进程，工具调用时也按需重连 —— 每查一次就 fork 好几个 Python 子进程。
+    只有把同一个 session 实例传给 load_mcp_tools(session=...)，工具调用才复用这条
+    常驻 stdio 连接。所以这里手动 __aenter__ 长期持有 session 和它的 context
+    manager（cm 留着，app 关停时 __aexit__ 干净退出）—— 整个应用生命周期只
+    fork 一个 MCP 子进程，100 个会话也不会起 100 个进程。
+
+    注意：不要用 MultiServerMCPClient.session() 包一层 —— 实测它包 callbacks 后
+    首个 list_tools 会卡死（memory stream WouldBlock）。直接 create_session 直连。
+    """
+    global _mcp_ctx
+    if _mcp_ctx is not None:
+        return _mcp_ctx
+    async with _mcp_ctx_lock:   # 双重检查：多个协程同时进来也只起一个进程
+        if _mcp_ctx is None:
+            from langchain_mcp_adapters.client import create_session
+
+            # 关键：文件在 multi_agent/ 目录，往上一级才是项目根，再进 mcp_tools/
+            server_path = os.path.join(
+                os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                "mcp_tools", "my_mcp_server.py",
+            )
+            connection = {
                 "transport": "stdio",
                 "command": sys.executable,   # 用 .venv 的 python，保证子进程有 mcp 包
                 "args": [server_path],       # 绝对路径，在哪启动 uvicorn 都不怕
             }
-        })
-        return await client.get_tools()
+            cm = create_session(connection)          # 手动持有 async context manager
+            session = await cm.__aenter__()
+            await session.initialize()               # 必须先初始化才能收发请求
+            _mcp_ctx = {"session": session, "connection": connection, "cm": cm}
+    return _mcp_ctx
+
+
+async def close_mcp():
+    """关闭全局 MCP 连接（FastAPI 关停时调用，避免挂在 asyncio 清理的报错噪音）。"""
+    global _mcp_ctx
+    if _mcp_ctx is not None:
+        try:
+            await _mcp_ctx["cm"].__aexit__(None, None, None)
+        except Exception as e:
+            print(f"[MCP] 关闭连接时异常（可忽略）：{e}")
+        _mcp_ctx = None
+
+
+async def load_mcp_tools(domain: str = "general"):
+    """
+    加载指定领域允许使用的 MCP 工具（LangChain 工具列表）。
+
+    架构：MCP server 暴露全部领域工具，这里按 registry 白名单过滤，
+    只把该领域该用的工具交给 Researcher —— 避免 LLM 在一堆无关工具里选。
+
+    企业级要点：传入共享 session，工具调用走同一条常驻 stdio 连接，
+    不再每次调用都 fork 子进程。
+
+    失败降级：MCP 连不上返回空列表，RAG 主流程不受影响（有日志可观测）。
+    """
+    try:
+        # 白名单过滤，先于启动子进程：没有工具就根本不用连 MCP
+        from mcp_tools.registry import get_domain_tools
+
+        whitelist = get_domain_tools(domain)
+        if not whitelist:
+            return []
+
+        ctx = await _get_mcp_ctx()
+        from langchain_mcp_adapters.client import load_mcp_tools as _load_from_session
+
+        tools = await _load_from_session(
+            ctx["session"], connection=ctx["connection"], server_name="mytools"
+        )
+        return [t for t in tools if t.name in whitelist]
     except Exception as e:
         print(f"[MCP] 加载 MCP 工具失败，已跳过：{e}")
         return []   # MCP 挂了不影响 RAG 主流程

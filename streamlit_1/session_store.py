@@ -80,6 +80,7 @@ def save_session(session_id, session, page_count):
         "page_count": page_count,
         "child_count": len(session["chunks"]),
         "parent_count": len(session["parent_docs"]),
+        "domain": session.get("domain", "general"),
     })
     r.sadd("session:index", session_id)   # 用 Set 记全部会话，健康检查数用它
     _cache_put(session_id, session)
@@ -119,9 +120,11 @@ async def _rebuild(session_id, checkpointer, store):
     except FileNotFoundError:
         bm25 = create_bm25(chunks)  # 兜底：pickle 丢了就从 chunks 重建
 
-    # MCP 工具连不上就退回纯本地工具，不影响使用
+    # MCP 工具按会话的领域加载（domain 存在 Redis 元数据里），
+    # 连不上就退回纯本地工具，不影响使用
+    domain = r.hget(_key(session_id), "domain") or "general"
     try:
-        mcp_tools = await load_mcp_tools()
+        mcp_tools = await load_mcp_tools(domain)
     except Exception:
         mcp_tools = []
 

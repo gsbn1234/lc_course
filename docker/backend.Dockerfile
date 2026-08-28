@@ -20,7 +20,7 @@ RUN pip install --no-cache-dir -i https://pypi.tuna.tsinghua.edu.cn/simple \
 # 业务代码。.env 故意不 COPY —— 里面是 API Key，只允许运行期由 compose env_file 注入
 COPY multi_agent/ ./multi_agent/
 COPY streamlit_1/ ./streamlit_1/
-COPY mcp/ ./mcp/
+COPY mcp_tools/ ./mcp_tools/
 COPY main.py ./main.py
 
 EXPOSE 8000

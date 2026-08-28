@@ -16,7 +16,7 @@ import shutil #用于递归清理临时目录（try/finally 保证出错也会�
 import uuid #生成唯一会话 id，每个上传 PDF 的用户拥有独立知识库
 import json #序列化字典字符串，SSE 传输的数据必须为 JSON 字符串
 import tempfile #创建操作系统临时文件夹，接收上传 PDF、加载文档，用完立刻清理，不占用磁盘
-from fastapi import FastAPI, UploadFile, File, HTTPException #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件；`Form`：接收非文件表单字段（如领域）
 from fastapi.responses import StreamingResponse #StreamingResponse:返回流式响应，适配 SSE 长连接，可以循环 yield 不断向前端发送消息，适合 LLM 流式输出、Agent 运行日志推送
 from fastapi.middleware.cors import CORSMiddleware #CORS 跨域中间件.浏览器同源策略：网页域名、端口和后端不一致就会拦截请求；你的 Streamlit 默认端口 8501，FastAPI 端口 8000，端口不同属于跨域，必须开启 CORS。
 from pydantic import BaseModel #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析
@@ -46,6 +46,13 @@ except ImportError:
 
 
 app = FastAPI(title="Adaptive Research Agent API")
+
+
+# 应用关停时关闭全局 MCP 子进程，干净退出（不关的话挂在 asyncio 清理上会报噪音错误）
+@app.on_event("shutdown")
+async def _shutdown_mcp():
+    from multi_agent.multi_agent_graph import close_mcp
+    await close_mcp()
 
 # CORS：允许 Streamlit 前端（8501 端口）跨域调用后端（8000 端口）
 app.add_middleware(
@@ -84,9 +91,13 @@ MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 单次上传总量上限 50MB
 # ========== 接口 1：上传 PDF + 建索引 ==========
 
 @app.post("/api/upload-pdf")
-async def upload_pdf(files: list[UploadFile] = File(...)):
+async def upload_pdf(
+    files: list[UploadFile] = File(...),
+    domain: str = Form("general"),
+):
     """
     上传一个或多个 PDF 文件，自动切分、建向量库 + BM25、编译 Agent 图。
+    domain：知识库领域（ai_learning/general/...），决定给 Researcher 挂哪些 MCP 工具。
     返回 session_id，之后的对话接口需要带上这个 ID。
     """
     if not files:
@@ -154,7 +165,7 @@ async def upload_pdf(files: list[UploadFile] = File(...)):
 
         # 7. 构建 Agent 图
         llm = get_llm()
-        mcp_tools = await load_mcp_tools()  # ← 新增：async 拉 MCP 工具
+        mcp_tools = await load_mcp_tools(domain)  # 按领域加载 MCP 工具（全局复用客户端）
         graph = build_multi_agent_graph(
             llm, vector_store, bm25, child_docs, parent_docs, max_tool_rounds=5,
             checkpointer=checkpointer,   # ← 持久化记忆；None 时内部自动退回 MemorySaver
@@ -176,6 +187,7 @@ async def upload_pdf(files: list[UploadFile] = File(...)):
         "parent_docs": parent_docs,
         "graph": graph,
         "llm": llm,
+        "domain": domain,   # 存领域，会话恢复时按它重新加载对应 MCP 工具
     }, page_count=len(docs))
 
     return {
@@ -183,6 +195,7 @@ async def upload_pdf(files: list[UploadFile] = File(...)):
         "page_count": len(docs),
         "child_chunks": len(child_docs),
         "parent_chunks": len(parent_docs),
+        "domain": domain,
     }
 
 
