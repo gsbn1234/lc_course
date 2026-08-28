@@ -14,7 +14,7 @@ import datetime
 import os
 import sys
 
-from mcp.server import FastMCP
+from mcp.server import FastMCP #导入官方 MCP‑SDK 的`FastMCP`服务端类；`FastMCP` 是高阶封装，快速创建 MCP 服务、注册工具、启动 stdio 通信。
 
 # 确保 mcp_tools/tools/ 可以被导入（直接 python 运行时工作目录是项目根，可省略；
 # 显式加保险，避免从别的目录启动时找不到）

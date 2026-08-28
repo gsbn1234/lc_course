@@ -275,10 +275,11 @@ def trim_messages(messages, keep=10):
 
 # ========== 3. 各节点函数 ==========
 
-def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:BaseStore):
+def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:BaseStore, mcp_tool_guide: str = ""):
     """
     问题改写 — 和之前完全一样。
     唯一的变化：初始化 researcher_messages 和 writer_messages 为空。
+    mcp_tool_guide：构图时算好的专业工具引导文案，拼进 Researcher 提示词。
     """
     question = state["question"]
     rewritten = rewrite_query(question, llm)
@@ -291,22 +292,7 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
             store.put(("users", user_id), "style", {"data": pref})
             print(f"\n[Memory] 已记住用户偏好：{pref}")
 
-    # MCP 领域工具引导：把挂载的专业工具写进提示词，Researcher 才会主动去用
-    # （光 bind_tools 不够——提示词里只点名 local_search/internet_search 时，
-    #   LLM 会一直优先用那两个，专业工具形同虚设）
-    mcp_tool_guide = ""
-    if extra_tools:
-        lines = []
-        for t in extra_tools:
-            desc = (t.description or "专业检索工具").splitlines()[0][:60]
-            lines.append(f"  {t.name}：{desc}")
-        mcp_tool_guide = (
-            f"\n- 你还有 {len(extra_tools)} 个专业检索工具（按需使用）：\n"
-            + "\n".join(lines)
-            + "\n- 当问题涉及开源项目选型、学术论文、模型选型等方向时，"
-              "优先用对应的专业工具，而不是只靠网页搜索。"
-        )
-
+    # mcp_tool_guide 由 build_multi_agent_graph 构图时算好传入（见 build 函数）
     researcher_system = SystemMessage(content=f"""你是一个专职的信息研究员。
 你的唯一任务：根据 Supervisor 给你的搜索指令，调用搜索工具获取信息。
 
@@ -326,7 +312,7 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
                 f"搜索参考方向：{rewritten}\n\n"
                 f"请先搜索本地知识库（技术概念和原理），如果本地信息不够或涉及实时信息，"
                 f"再搜互联网。"
-                f"{'如有开源项目、论文、模型选型相关需求，优先用对应的专业检索工具。' if extra_tools else ''}"
+                f"{'如有开源项目、论文、模型选型相关需求，优先用对应的专业检索工具。' if mcp_tool_guide else ''}"
                 f"搜完后整理好材料，等待 Writer 接手。"
     )
 
@@ -690,10 +676,26 @@ def build_multi_agent_graph(
     researcher_llm = llm.bind_tools(search_tools)
     researcher_tool_node = ToolNode(search_tools)
 
+    # MCP 领域工具引导：构图时算好，传给 rewrite_query_node 拼进 Researcher 提示词。
+    # （光 bind_tools 不够——提示词里只点名 local_search/internet_search 时，
+    #   LLM 会一直优先用那两个，专业工具形同虚设）
+    mcp_tool_guide = ""
+    if extra_tools:
+        lines = []
+        for t in extra_tools:
+            desc = (t.description or "专业检索工具").splitlines()[0][:60]
+            lines.append(f"  {t.name}：{desc}")
+        mcp_tool_guide = (
+            f"\n- 你还有 {len(extra_tools)} 个专业检索工具（按需使用）：\n"
+            + "\n".join(lines)
+            + "\n- 当问题涉及开源项目选型、学术论文、模型选型等方向时，"
+              "优先用对应的专业工具，而不是只靠网页搜索。"
+        )
+
     graph = StateGraph(MultiAgentState)
 
     # 注册节点
-    graph.add_node("rewrite_query_node", lambda s,config,store: rewrite_query_node(s, llm,config,store))
+    graph.add_node("rewrite_query_node", lambda s,config,store: rewrite_query_node(s, llm,config,store, mcp_tool_guide))
     graph.add_node("supervisor_node", supervisor_node)
     graph.add_node("researcher_agent", lambda s: researcher_agent_node(s, researcher_llm))
     async def _researcher_tool_node(s):

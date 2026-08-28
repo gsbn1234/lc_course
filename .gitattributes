@@ -1,0 +1,5 @@
+# 统一换行符（企业级标配）：
+#   索引/仓库里一律存 LF；Windows 检出时自动转 CRLF，Linux/mac 检出 LF。
+# 作用：避免 PyCharm(Windows, CRLF) 与 WSL(git, LF) 混用导致
+#       整个文件被 git 误判为"全部改动"。
+* text=auto
