@@ -223,30 +223,41 @@ async def chat_stream(req: ChatRequest):
             "metadata": {"session_id": req.session_id},
         }
         try:
-            async for chunk in graph.astream(
+            async for mode, chunk in graph.astream(
                 {"question": req.question, "researcher_rounds": 0, "max_tool_rounds": req.max_tool_rounds},
                 config=config,
-                stream_mode="values",
+                stream_mode=["values", "messages"],  # values=节点级状态；messages=Writer 生成 token
             ):
-                result = chunk
-                next_agent = chunk.get("next_agent", "")
-                rounds = chunk.get("researcher_rounds", 0)
+                if mode == "values":
+                    result = chunk
+                    next_agent = chunk.get("next_agent", "")
+                    rounds = chunk.get("researcher_rounds", 0)
 
-                if next_agent == "researcher":
-                    yield f"data: {json.dumps({'type': 'status', 'agent': 'researcher', 'rounds': rounds}, ensure_ascii=False)}\n\n"
-                elif next_agent == "writer":
-                    yield f"data: {json.dumps({'type': 'status', 'agent': 'writer'}, ensure_ascii=False)}\n\n"
+                    if next_agent == "researcher":
+                        yield f"data: {json.dumps({'type': 'status', 'agent': 'researcher', 'rounds': rounds}, ensure_ascii=False)}\n\n"
+                    elif next_agent == "writer":
+                        # Writer 每轮开写前发一个信号，前端用它清空上一轮草稿
+                        yield f"data: {json.dumps({'type': 'writer_start'}, ensure_ascii=False)}\n\n"
 
-                # 推送工具调用事件
-                research_msgs = chunk.get("researcher_messages", [])
-                if research_msgs:
-                    last_msg = research_msgs[-1]
-                    tool_calls = getattr(last_msg, "tool_calls", None)
-                    if tool_calls:
-                        for tc in tool_calls:
-                            yield f"data: {json.dumps({'type': 'tool_call', 'name': tc['name'], 'args': tc['args']}, ensure_ascii=False)}\n\n"
+                    # 推送工具调用事件
+                    research_msgs = chunk.get("researcher_messages", [])
+                    if research_msgs:
+                        last_msg = research_msgs[-1]
+                        tool_calls = getattr(last_msg, "tool_calls", None)
+                        if tool_calls:
+                            for tc in tool_calls:
+                                yield f"data: {json.dumps({'type': 'tool_call', 'name': tc['name'], 'args': tc['args']}, ensure_ascii=False)}\n\n"
 
-            # 推送最终答案
+                elif mode == "messages":
+                    # messages 流：每个 chunk 是 (AIMessageChunk, metadata)
+                    # 只透传 Writer 的生成 token；Researcher/Reviewer 的调用被过滤，不打扰前端
+                    msg_chunk, metadata = chunk
+                    if metadata.get("langgraph_node") == "writer_agent":
+                        content = getattr(msg_chunk, "content", "")
+                        if content:
+                            yield f"data: {json.dumps({'type': 'token', 'content': content}, ensure_ascii=False)}\n\n"
+
+            # 推送最终答案（终稿，含 Reviewer 修订后的结果）
             answer = extract_answer(result)
             yield f"data: {json.dumps({'type': 'done', 'answer': answer}, ensure_ascii=False)}\n\n"#`ensure_ascii=False`：让中文正常显示，不会被转成 `\uXXXX`
         except Exception as e:

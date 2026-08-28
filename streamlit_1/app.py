@@ -138,16 +138,24 @@ if prompt:
                                 status_container.info(
                                     f"🔍 Researcher 第 {data.get('rounds', '?')} 轮搜索中..."
                                 )
-                            elif agent == "writer":
-                                status_container.info("✍️ Writer 正在撰写答案...")
+                        elif event_type == "writer_start":
+                            # 新一轮写作开始：清掉上一轮草稿（Reviewer 打回重写时）
+                            status_container.info("✍️ Writer 正在撰写答案...")
+                            answer = ""
+                            answer_container.markdown("")
+                        elif event_type == "token":
+                            # 逐字追加，实现打字机效果
+                            answer += data["content"]
+                            answer_container.markdown(answer)
                         elif event_type == "tool_call":
                             tool_logs.append(
                                 f"🔧 {data['name']}({data['args']})"
                             )
                         elif event_type == "done":
                             status_container.empty()
+                            # 终稿（含 Reviewer 修订），覆盖流式内容，保证显示最终版本
                             answer = data["answer"]
-                            st.write(answer)
+                            answer_container.markdown(answer)
                         elif event_type == "error":
                             status_container.empty()
                             st.error(f"后端处理出错：{data.get('message', '未知错误')}")

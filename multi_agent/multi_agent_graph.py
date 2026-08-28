@@ -359,12 +359,14 @@ def researcher_agent_node(state: MultiAgentState, researcher_llm):
             "next_agent": "writer",
         }
 
-def writer_agent_node(state: MultiAgentState, llm,config:RunnableConfig,store:BaseStore):
+async def writer_agent_node(state: MultiAgentState, llm,config:RunnableConfig,store:BaseStore):
     """
     Writer Agent — 用 Researcher 的材料生成最终答案。
 
-    和普通 LLM 节点一样：读材料 → 写答案。
-    不需要工具，不需要循环。
+    改成流式生成（async + astream）：
+      - 图以 stream_mode="messages" 跑时，Writer 生成中的每个 token 会被
+        LangGraph 捕获，后端能逐字推给前端（打字机效果）
+      - 不用流式模式时（如评估的 ainvoke），照常累积成完整答案，行为不变
     """
     messages = state.get("writer_messages", [])
     messages = trim_messages(messages, keep=6)
@@ -375,7 +377,16 @@ def writer_agent_node(state: MultiAgentState, llm,config:RunnableConfig,store:Ba
     if pref is not None and pref.value.get("data"):
         messages = [SystemMessage(content=f"用户偏好：{pref.value['data']}。请严格按此偏好组织回答。")] + messages
 
-    response = llm.invoke(messages)
+    # 流式生成：config 必须透传，LangGraph 的 messages 流模式靠它捕获 token
+    chunks = []
+    async for chunk in llm.astream(messages, config=config):
+        chunks.append(chunk)
+
+    # 把分片拼成完整响应（AIMessageChunk 支持 += 合并）
+    response = chunks[0] if chunks else AIMessage(content="")
+    for c in chunks[1:]:
+        response += c
+
     return {
         "writer_messages": [response],
         "next_agent": "finish",
@@ -601,7 +612,11 @@ def build_multi_agent_graph(
         return await researcher_tool_execute(s, researcher_tool_node)
 
     graph.add_node("researcher_tool_node", _researcher_tool_node)
-    graph.add_node("writer_agent", lambda s,config,store: writer_agent_node(s, llm,config, store))
+    async def _writer_agent_node(s, config, store):
+        # async 包装：writer 现在是 astream 流式生成
+        return await writer_agent_node(s, llm, config, store)
+
+    graph.add_node("writer_agent", _writer_agent_node)
     graph.add_node("reviewer_agent", lambda s: reviewer_agent_node(s, llm, max_review_rounds))
 
     # 连线
