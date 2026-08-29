@@ -55,6 +55,51 @@
 
 ---
 
+## 架构决策记录（ADR）
+
+每个决策先交代"备选方案是什么、为什么没选"，面试被追问时按这个思路答。
+
+### ADR-1：为什么用 LangGraph，而不是 CrewAI / AutoGen / 手写状态机
+
+**需求驱动**：本系统核心是"Reviewer 审核不过 → 打回 Researcher 带修改意见重搜"的**循环**，
+以及**多轮对话持久化**（checkpoint）。需要的是可控制的图结构，不是自由的对话流水线。
+
+- **LangGraph**：`StateGraph` + 条件边 + checkpoint 天然表达"循环直到达标"，能精确控制
+  每轮的工具调用和审核回路；`stream_mode` 还支持 `values`（节点状态）+ `messages`（token）双路流式。
+- **CrewAI**：偏任务流水线（Role/Task 编排），对复杂循环、checkpoint 记忆的控制较弱。
+- **AutoGen**：对话式多智能体，适合"辩论/讨论"型协作；对"检索→写作→审核→打回"这种确定性流程反而不可控。
+- **手写状态机**：要自己实现 checkpoint、并发、流式，工程量不划算。
+
+### ADR-2：为什么工具走 MCP 协议，而不是直接把工具 `bind_tools` 给 Researcher
+
+- **隔离性**：MCP server 是独立 stdio 子进程，工具崩溃不会拖垮 Agent 主进程。
+- **标准协议**：MCP 是行业标准（Anthropic/OpenAI 均支持），工具可跨语言、跨框架复用，
+  不绑死在 LangChain 生态里。
+- **领域化白名单**：`mcp_tools/registry.py` 按领域（ai_learning/general/...）过滤要挂载的工具，
+  新增领域只加"server 注册 + registry 映射"两处，不改接入链路。
+- 代价：stdio 进程间通信多一次 IPC 开销；为复用子进程做了全局客户端 + 锁的单例管理。
+
+### ADR-3：为什么父子两粒度切分（child 搜 / parent 返）
+
+- 小 chunk（200 字符）检索**精度高**，但上下文碎片化；大 chunk（800 字符）上下文**完整**，但召回噪声大。
+- 折中：在 child 上建向量 + BM25 索引做精检索，命中后映射回所属 parent 整块喂给 LLM——
+  既搜得准，又不丢失上下文。
+
+### ADR-4：为什么前后端分离 + SSE 流式
+
+- Streamlit 直接调 graph 会把 LLM 长时间阻塞在网页会话里，无法逐 token 展示过程。
+- 拆成 FastAPI + SSE 后：检索状态、工具调用、Writer token 全部实时推送，前端做打字机效果；
+  后端可独立水平扩展，任意前端（网页/移动/CLI）复用同一套 API。
+
+### ADR-5：为什么会话用三层存储（内存 LRU + Redis + 磁盘）
+
+- 最贵的操作是"重载 embedding 模型 + 重建图"（几秒级、烧资源）——内存 LRU 缓存（上限 20 个）
+  命中热会话时开销降到零。
+- Redis 存会话**元数据**（多进程 / 后端重启共享）；磁盘存**重物**（向量库 / 切块 / bm25 pickle）。
+- 冷启动路径：Redis 命中元数据 → 从磁盘重建 → 回填 LRU。重启不丢会话。
+
+---
+
 ## 技术栈
 
 | 分类 | 技术 |
@@ -96,7 +141,11 @@ lc_course/
 ├── streamlit_1/
 │   ├── backend.py             # FastAPI 后端（上传 / 流式对话 / 健康检查）
 │   └── app.py                 # Streamlit 前端
-├── mcp/my_mcp_server.py       # 自定义 MCP Server（示例工具）
+├── mcp_tools/                 # 自定义 MCP Server（领域化工具注册）
+│   ├── registry.py            #   领域 → 工具白名单（ai_learning/general/...）
+│   ├── my_mcp_server.py       #   FastMCP stdio server（暴露全部领域工具）
+│   └── tools/
+│       └── ai_learning.py     #   AI 学习领域真实工具（GitHub / arXiv / HuggingFace）
 ├── docs/                      # 知识库 PDF（喂给 RAG 的原始文档）
 ├── evaluate.py                # LLM-as-Judge 三维度评估
 ├── eval_compare.py            # HyDE 开关对比评估
