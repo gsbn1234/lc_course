@@ -57,7 +57,9 @@ async def _shutdown_mcp():
 # CORS：允许 Streamlit 前端（8501 端口）跨域调用后端（8000 端口）
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 开发阶段允许所有来源，生产环境改成具体域名
+    allow_origins=["http://localhost:8501", "http://127.0.0.1:8501"],
+    # 只放行 Streamlit 前端来源。注意：allow_origins=["*"] 与 allow_credentials=True
+    # 是浏览器禁止的组合（通配符不可带凭证），必须写死具体 origin。
     allow_credentials=True,#允许携带 cookie 凭证
     allow_methods=["*"],#允许全部 HTTP 方法 GET/POST/PUT/DELETE
     allow_headers=["*"],#允许前端所有请求头

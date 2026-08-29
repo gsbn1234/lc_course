@@ -8,27 +8,32 @@ Redis 会话存储 — 替代 backend.py 里的内存 sessions dict。
 
 三层存储分工：
   Redis   → 会话元数据：session_id → 索引路径、页数、创建时间
-  磁盘    → 每个会话的重物：FAISS 索引目录 + chunks/parent_docs/bm25 的 pickle
+  磁盘    → 每个会话的重物：FAISS 索引目录 + chunks/parent_docs 的 JSON
   内存缓存→ 最近用过的 graph：重建一次后缓存，避免每次请求都重载模型
 
 目录结构：
   faiss_db/sessions/{session_id}/
     ├── faiss_index/       # FAISS 向量库（save_local 产出）
-    ├── chunks.pkl         # child Document 列表
-    ├── parent_docs.pkl    # parent Document 列表
-    └── bm25.pkl           # BM25 索引
+    ├── chunks.json        # child Document 列表
+    └── parent_docs.json   # parent Document 列表
 
-★ pickle 安全提醒：pickle.load 对不可信数据有代码执行风险。
-  本项目只加载自己存的会话（本地学习用），可接受；生产环境应改 JSON 或加签名校验。
+为什么不用 pickle：pickle.load 对不可信数据有任意代码执行风险。
+  本模块原本用 pickle 落盘 chunks/parent_docs/bm25，现统一改 JSON；
+  bm25 不落盘（加载时从 chunks 重建，秒级）。旧会话的 .pkl 在加载时
+  仍可读（_load_docs 回退），存量不丢。唯一保留 pickle 的地方是
+  FAISS 索引自身的二进制序列化，它要求 allow_dangerous_deserialization=True，
+  信任边界：这些文件只由本应用写入。
 """
+import json
 import os
-import pickle
+import pickle  # 仅用于兼容旧会话 .pkl 的迁移读取
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
 
 import redis
 from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
 
 from multi_agent.bm25 import create_bm25
 from multi_agent.embedding import get_embeddings
@@ -61,18 +66,35 @@ def _cache_put(session_id, session):
         _cache.popitem(last=False)  # 淘汰最久没用的
 
 
+def _docs_to_json(docs) -> str:
+    """Document 列表 → JSON 字符串（只留 page_content + metadata 两个有效载荷）。"""
+    return json.dumps(
+        [{"page_content": d.page_content, "metadata": d.metadata} for d in docs],
+        ensure_ascii=False,          # 中文原文可读，不是 \uXXXX
+    )
+
+
+def _load_docs(json_path, pickle_path):
+    """优先读 JSON；旧会话只有 .pkl 时回退 pickle —— 存量会话不丢，迁移零成本。"""
+    if json_path.exists():
+        with open(json_path, "r", encoding="utf-8") as f:
+            return [
+                Document(page_content=row["page_content"], metadata=row.get("metadata", {}))
+                for row in json.load(f)
+            ]
+    with open(pickle_path, "rb") as f:      # 旧格式兼容
+        return pickle.load(f)
+
+
 def save_session(session_id, session, page_count):
     """上传建好索引后调用：重物落盘 + 元数据进 Redis + 缓存起来。
     session 形如 {vector_store, bm25, chunks, parent_docs, graph, llm}"""
     session_dir = SESSIONS_DIR / session_id
     (session_dir / "faiss_index").mkdir(parents=True, exist_ok=True)
     session["vector_store"].save_local(str(session_dir / "faiss_index"))
-    with open(session_dir / "chunks.pkl", "wb") as f:
-        pickle.dump(session["chunks"], f)
-    with open(session_dir / "parent_docs.pkl", "wb") as f:
-        pickle.dump(session["parent_docs"], f)
-    with open(session_dir / "bm25.pkl", "wb") as f:
-        pickle.dump(session["bm25"], f)
+    (session_dir / "chunks.json").write_text(_docs_to_json(session["chunks"]), encoding="utf-8")
+    (session_dir / "parent_docs.json").write_text(_docs_to_json(session["parent_docs"]), encoding="utf-8")
+    # bm25 不落盘：加载时从 chunks 重建（建一次索引秒级），直接消灭一个 pickle 风险源
 
     r.hset(_key(session_id), mapping={
         "status": "ready",
@@ -110,15 +132,9 @@ async def _rebuild(session_id, checkpointer, store):
     vector_store = FAISS.load_local(
         str(index_dir), embeddings, allow_dangerous_deserialization=True
     )
-    with open(session_dir / "chunks.pkl", "rb") as f:
-        chunks = pickle.load(f)
-    with open(session_dir / "parent_docs.pkl", "rb") as f:
-        parent_docs = pickle.load(f)
-    try:
-        with open(session_dir / "bm25.pkl", "rb") as f:
-            bm25 = pickle.load(f)
-    except FileNotFoundError:
-        bm25 = create_bm25(chunks)  # 兜底：pickle 丢了就从 chunks 重建
+    chunks = _load_docs(session_dir / "chunks.json", session_dir / "chunks.pkl")
+    parent_docs = _load_docs(session_dir / "parent_docs.json", session_dir / "parent_docs.pkl")
+    bm25 = create_bm25(chunks)   # 原 FileNotFoundError 兜底升级成唯一路径，不再落盘
 
     # MCP 工具按会话的领域加载（domain 存在 Redis 元数据里），
     # 连不上就退回纯本地工具，不影响使用
