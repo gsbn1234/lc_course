@@ -18,8 +18,11 @@
           即 README 架构图里的检索流水线。
 """
 import io
+import time
 from contextlib import redirect_stdout
+from datetime import date
 
+from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 
 from multi_agent.config import PROJECT_ROOT
@@ -76,40 +79,85 @@ LLM 生成的回答：{answer}
 只输出一个 0.0 到 1.0 之间的数字，不要任何解释。""")
 
 
+# ========== 性能/成本采集 ==========
+
+# DeepSeek V4-Flash 官网现行计价（元 / 百万 token）。评估为一次性脚本，基本无缓存命中，按 miss 计。
+INPUT_PRICE_PER_M = 1.0    # 输入（缓存未命中）
+OUTPUT_PRICE_PER_M = 2.0   # 输出
+
+
+class TokenCounter(BaseCallbackHandler):
+    """挂在 LLM 调用链上，累计所有经手调用的输入/输出 token。
+
+    用法：把 counter 放进 config={"callbacks": [counter]}，然后对每次调用前后
+    快照 self.input_tokens / self.output_tokens 即可拿到"这一段的 token 增量"。
+    """
+
+    def __init__(self):
+        self.input_tokens = 0
+        self.output_tokens = 0
+
+    def on_llm_end(self, response, **kwargs):
+        for gen in response.generations:
+            um = getattr(gen[0].message, "usage_metadata", None) or {}
+            # langchain 归一化字段；不同 provider 可能有 prompt_tokens 命名
+            self.input_tokens += um.get("input_tokens") or um.get("prompt_tokens") or 0
+            self.output_tokens += um.get("output_tokens") or um.get("completion_tokens") or 0
+        # 兜底：OpenAI 兼容的 llm_output.token_usage（usage_metadata 缺失时）
+        lu = (response.llm_output or {}).get("token_usage") or {}
+        self.input_tokens += lu.get("prompt_tokens", 0)
+        self.output_tokens += lu.get("completion_tokens", 0)
+
+
 # ========== 统一评估入口 ==========
 
 def run_evaluation(name, answer_fn, llm):
     """
-    跑一轮评估：answer_fn(question) -> (answer, contexts_text)。
+    跑一轮评估：answer_fn(question, callbacks=None) -> (answer, contexts_text)。
     三个档位共用同一接口、同一套 judge、同一份数据集，
     保证打分口径一致，只有"检索链路"不同。
+
+    性能采集：每题记答案阶段耗时 + 输入/输出 token（只计答案的 LLM 调用）；
+    tier_total_* 把裁判打分也计入，用于算"跑一次评估烧多少钱"。
     """
     results = []
+    perf_rows = []
+    tier_total_in = 0
+    tier_total_out = 0
     for i, item in enumerate(EVAL_DATASET, 1):
         question = item["question"]
         ground_truth = item["ground_truth"]
 
-        answer, contexts_text = answer_fn(question)
+        # 答案阶段：计时 + 只数这一段的 token
+        counter = TokenCounter()
+        t0 = time.perf_counter()
+        answer, contexts_text = answer_fn(question, callbacks=[counter])
+        latency_s = time.perf_counter() - t0
+        a_in, a_out = counter.input_tokens, counter.output_tokens
 
+        # 裁判阶段：3 次打分 LLM 调用，沿用同一计数器（计入总成本，不单独计时）
         recall_score = float(
-            (context_recall_prompt | llm).invoke({
-                "ground_truth": ground_truth,
-                "contexts": contexts_text,
-            }).content.strip()
+            (context_recall_prompt | llm).invoke(
+                {"ground_truth": ground_truth, "contexts": contexts_text},
+                config={"callbacks": [counter]},
+            ).content.strip()
         )
         faith_score = float(
-            (faithfulness_prompt | llm).invoke({
-                "contexts": contexts_text,
-                "answer": answer,
-            }).content.strip()
+            (faithfulness_prompt | llm).invoke(
+                {"contexts": contexts_text, "answer": answer},
+                config={"callbacks": [counter]},
+            ).content.strip()
         )
         relevancy_score = float(
-            (answer_relevancy_prompt | llm).invoke({
-                "question": question,
-                "answer": answer,
-            }).content.strip()
+            (answer_relevancy_prompt | llm).invoke(
+                {"question": question, "answer": answer},
+                config={"callbacks": [counter]},
+            ).content.strip()
         )
 
+        tier_total_in += counter.input_tokens
+        tier_total_out += counter.output_tokens
+        perf_rows.append({"latency_s": latency_s, "in_tokens": a_in, "out_tokens": a_out})
         results.append({
             "question": question,
             "context_recall": recall_score,
@@ -117,13 +165,21 @@ def run_evaluation(name, answer_fn, llm):
             "answer_relevancy": relevancy_score,
         })
         print(f"  [{i}/{len(EVAL_DATASET)}] {question[:22]:<22s}"
-              f" R={recall_score:.2f} F={faith_score:.2f} A={relevancy_score:.2f}")
+              f" R={recall_score:.2f} F={faith_score:.2f} A={relevancy_score:.2f}"
+              f" | {latency_s:.1f}s {a_in}in {a_out}out")
 
     n = len(results)
     avg_recall = sum(r["context_recall"] for r in results) / n
     avg_faith = sum(r["faithfulness"] for r in results) / n
     avg_relevancy = sum(r["answer_relevancy"] for r in results) / n
-    return results, avg_recall, avg_faith, avg_relevancy
+    perf_agg = {
+        "avg_latency_s": sum(p["latency_s"] for p in perf_rows) / n,
+        "avg_in": sum(p["in_tokens"] for p in perf_rows) / n,
+        "avg_out": sum(p["out_tokens"] for p in perf_rows) / n,
+        "tier_in": tier_total_in,      # 含裁判，用于总成本
+        "tier_out": tier_total_out,
+    }
+    return results, avg_recall, avg_faith, avg_relevancy, perf_agg
 
 
 # ========== 三个档位的 answer_fn ==========
@@ -133,28 +189,31 @@ direct_prompt = ChatPromptTemplate.from_template(
 )
 
 
-def direct_answer(question, llm):
+def direct_answer(question, llm, callbacks=None):
     """档位1：无检索直答。上下文为空，测 LLM 裸答质量。"""
-    answer = (direct_prompt | llm).invoke({"question": question}).content
+    answer = (direct_prompt | llm).invoke(
+        {"question": question}, config={"callbacks": callbacks}
+    ).content
     return answer, ""
 
 
-def naive_rag_answer(question, llm, vector_store):
+def naive_rag_answer(question, llm, vector_store, callbacks=None):
     """档位2：单路检索。向量 top-k 直接拼上下文，不做任何增强。"""
     docs = vector_store.similarity_search(question, k=4)
     contexts_text = "\n\n".join(d.page_content for d in docs)
-    answer = (answer_prompt | llm).invoke({
-        "context": contexts_text,
-        "question": question,
-    }).content
+    answer = (answer_prompt | llm).invoke(
+        {"context": contexts_text, "question": question},
+        config={"callbacks": callbacks},
+    ).content
     return answer, contexts_text
 
 
 def full_answer_fn(graph):
     """档位3：完整系统。跑整张图，从 final_docs 取上下文。"""
-    def _fn(question):
+    def _fn(question, callbacks=None):
+        config = {"callbacks": callbacks} if callbacks else {}
         with redirect_stdout(io.StringIO()):
-            result = graph.invoke({"question": question})
+            result = graph.invoke({"question": question}, config=config)
         contexts_text = "\n---\n".join(
             item["doc"].page_content for item in result["final_docs"]
         )
@@ -179,38 +238,45 @@ def main():
     )
 
     tiers = [
-        ("无检索直答", lambda q: direct_answer(q, llm)),
-        ("单路检索",   lambda q: naive_rag_answer(q, llm, child_vector_store)),
+        ("无检索直答", lambda q, callbacks=None: direct_answer(q, llm, callbacks=callbacks)),
+        ("单路检索",   lambda q, callbacks=None: naive_rag_answer(q, llm, child_vector_store, callbacks=callbacks)),
         ("完整系统",   full_answer_fn(graph_full)),
     ]
 
     all_results = {}
+    run_total_in = 0
+    run_total_out = 0
     for name, fn in tiers:
         print(f"\n========== 档位：{name} ==========")
-        results, r, f, a = run_evaluation(name, fn, llm)
-        all_results[name] = (results, r, f, a)
+        results, r, f, a, perf = run_evaluation(name, fn, llm)
+        all_results[name] = (results, r, f, a, perf)
+        run_total_in += perf["tier_in"]
+        run_total_out += perf["tier_out"]
 
     # ========== 控制台对比 ==========
-    print("\n" + "=" * 70)
+    print("\n" + "=" * 78)
     print("                    三档基线对比")
-    print("=" * 70)
-    print(f"  {'档位':<10s} {'Recall':>8s} {'Faith':>8s} {'Relev':>8s}")
-    for name, (_, r, f, a) in all_results.items():
-        print(f"  {name:<10s} {r:>8.4f} {f:>8.4f} {a:>8.4f}")
-    print("=" * 70)
+    print("=" * 78)
+    print(f"  {'档位':<10s} {'Recall':>8s} {'Faith':>8s} {'Relev':>8s} {'耗时/题s':>9s}")
+    for name, (_, r, f, a, perf) in all_results.items():
+        print(f"  {name:<10s} {r:>8.4f} {f:>8.4f} {a:>8.4f} {perf['avg_latency_s']:>9.2f}")
+    print("=" * 78)
+    cost_yuan = (run_total_in * INPUT_PRICE_PER_M + run_total_out * OUTPUT_PRICE_PER_M) / 1_000_000
+    print(f"\n  全程 token：{run_total_in / 1000:.1f}k 输入 + {run_total_out / 1000:.1f}k 输出"
+          f" ≈ ¥{cost_yuan:.3f}（输入 ¥1/百万·miss + 输出 ¥2/百万）")
 
     # ========== 写 Markdown ==========
     out_path = PROJECT_ROOT / "docs" / "eval_baseline_result.md"
     out_path.parent.mkdir(exist_ok=True)
-    out_path.write_text(build_markdown(all_results), encoding="utf-8")
+    out_path.write_text(build_markdown(all_results, run_total_in, run_total_out), encoding="utf-8")
     print(f"\n结果已写入 {out_path}")
 
 
-def build_markdown(all_results):
+def build_markdown(all_results, run_total_in, run_total_out):
     lines = []
     lines.append("# 三档基线对比评估结果")
     lines.append("")
-    lines.append("> 生成时间：2026-08-29")
+    lines.append(f"> 生成时间：{date.today().isoformat()}")
     lines.append("> 测试集：自建 5 题（docs/ 覆盖的 4 个本地题 + 1 个联网题）")
     lines.append("> 裁判：DeepSeek LLM-as-Judge（Context Recall / Faithfulness / Answer Relevancy，0.0-1.0）")
     lines.append("> 口径：同一份测试集、同一个裁判、同一套打分规则，仅检索链路不同。")
@@ -219,14 +285,33 @@ def build_markdown(all_results):
     lines.append("")
     lines.append("| 档位 | Context Recall | Faithfulness | Answer Relevancy |")
     lines.append("|------|---------------|--------------|------------------|")
-    for name, (_, r, f, a) in all_results.items():
+    for name, (_, r, f, a, _) in all_results.items():
         lines.append(f"| {name} | {r:.4f} | {f:.4f} | {a:.4f} |")
+    lines.append("")
+    lines.append("## 性能与成本")
+    lines.append("")
+    lines.append(f"> 实测于 {date.today().isoformat()}，模型 deepseek-v4-flash。")
+    lines.append("> 耗时 = 答案阶段墙钟时间；token = 答案阶段 LLM 输入/输出（裁判打分只计入总成本）。")
+    lines.append("")
+    lines.append("| 档位 | 平均耗时/题 (s) | 平均输入 token | 平均输出 token |")
+    lines.append("|------|---------------|---------------|---------------|")
+    for name, (_, _, _, _, perf) in all_results.items():
+        lines.append(
+            f"| {name} | {perf['avg_latency_s']:.2f} | {perf['avg_in']:.0f} | {perf['avg_out']:.0f} |"
+        )
+    cost_yuan = (run_total_in * INPUT_PRICE_PER_M + run_total_out * OUTPUT_PRICE_PER_M) / 1_000_000
+    lines.append("")
+    lines.append(
+        f"- 一次完整评估（3 档 × 5 题 + 15 次裁判打分）共消耗约 "
+        f"{run_total_in / 1000:.1f}k 输入 + {run_total_out / 1000:.1f}k 输出 token，"
+        f"按官网价（输入 ¥1/百万·缓存未命中、输出 ¥2/百万）约 **¥{cost_yuan:.3f}**。"
+    )
     lines.append("")
     lines.append("## 每题明细")
     lines.append("")
     lines.append("| # | 问题 | 档位 | R | F | A |")
     lines.append("|---|------|------|---|---|---|")
-    for name, (results, _, _, _) in all_results.items():
+    for name, (results, _, _, _, _) in all_results.items():
         for i, res in enumerate(results, 1):
             lines.append(
                 f"| {i} | {res['question'][:30]} | {name} "
