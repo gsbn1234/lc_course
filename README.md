@@ -100,6 +100,27 @@
 
 ---
 
+## 评测与基线对比
+
+同一份 5 题测试集、同一个 LLM 裁判（Context Recall / Faithfulness / Answer Relevancy，0-1 分），
+三档系统只换检索链路，打分口径完全一致：
+
+| 档位 | Context Recall | Faithfulness | Answer Relevancy |
+|------|---------------|--------------|------------------|
+| 无检索直答（LLM 裸答，无上下文） | 0.0000 | 0.0000 | 1.0000 |
+| 单路检索（仅向量 top-k） | 0.5200 | 0.9400 | 0.5400 |
+| 完整系统（改写+路由+父子+HyDE+精排+压缩） | 0.6800 | 1.0000 | 0.7000 |
+
+- **无检索直答** Recall/Faithfulness 双 0 → 证明"检索增强"的必要性；
+- **完整系统**三维度全面超过单路检索 → 证明高级检索组件不是炫技；
+- 联网题（DeepSeek-R1）只有完整系统能答：router 正确识别时效题 → 走 Tavily → 作答。
+  这个缺陷是评估暴露的（原 router 把无关键词的时效题误判为 local），已通过改进 router 提示词修复。
+
+> 局限（面试主动说明）：测试集为自建 5 题小集；裁判为 LLM-as-Judge，单次运行有随机波动，
+> 看方向不看绝对值。逐题明细见 `docs/eval_baseline_result.md`。复现：`python eval_baseline.py`。
+
+---
+
 ## 技术栈
 
 | 分类 | 技术 |
@@ -221,6 +242,7 @@ streamlit run streamlit_1/app.py
 ```bash
 python evaluate.py            # 三维度评估
 python eval_compare.py        # HyDE 开关对比
+python eval_baseline.py       # 三档基线对比（无检索 vs 单路 vs 完整）
 ```
 
 ### 6. 跑单元测试（pytest）
