@@ -1,0 +1,38 @@
+# GitHub Actions CI —— 单元测试门禁
+# tests/ 全离线（假 LLM + 合成文档，不联网、不烧 token），CI 不需要任何真实密钥。
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:        # 手动触发（Actions 标签页点 Run），调试用
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'   # 与 docker/backend.Dockerfile 一致
+          cache: pip               # 按 requirements.txt 缓存 pip，torch wheel 也能复用
+
+      # 先装 torch（CPU 版）：tests 经 multi_agent_graph → reranker → sentence-transformers
+      # 间接依赖 torch，而 requirements.txt 故意不含 torch（同 Dockerfile 配方）。
+      - name: Install torch (CPU)
+        run: pip install torch==2.13.0 --index-url https://download.pytorch.org/whl/cpu
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # CI 没有 .env：test_deepseek_key_loaded 只断言 key 非空，
+      # 用占位值走通；LANGSMITH_TRACING=false 关掉追踪 banner。
+      - name: Run tests
+        env:
+          DEEPSEEK_API_KEY: ci-dummy
+          LANGSMITH_TRACING: "false"
+        run: python -m pytest -v
