@@ -1,10 +1,30 @@
-# lc_course — Multi-Agent 智能检索系统
+# doc-intel — 资料研究员：会自己查证的多 Agent 知识库问答系统
 
-基于 **LangGraph** 构建的多 Agent 协作检索系统（Supervisor + Researcher + Writer + Reviewer），
-集成 **Parent Document 混合检索**（FAISS 向量 + BM25 关键词）、**CrossEncoder 精排**、
-**上下文压缩**、**HyDE 假想答案**、**长期记忆** 与 **MCP 工具**，并提供 FastAPI + Streamlit 全栈服务。
+> **一句话定位**：不是又一个"上传 PDF 再聊两句"的问答 demo——是给你的资料库配一个
+> **会自己查证的研究员**。它把每一次回答都当"研究任务"跑完整流程：
+> **改写问题 → 判断查本地还是联网 → 多路检索（本地库 / Tavily 联网 / GitHub·arXiv·HuggingFace 专业工具）→ 成文 → 按"忠实 / 完整 / 相关"三规则审稿，不合格带修改意见打回重写**（最多两轮）。
 
-> 学习项目：AI Agent 应用开发方向的完整实践（RAG → Agentic RAG → Multi-Agent）。
+**解决谁的什么问题**：学 AI 工程的人"收藏了几百份资料，提问时却答不出好答案"。
+通用 RAG 只能复述资料里已有的话；而最容易答错、也最需要把关的恰恰是这三类问题——
+
+1. **要跨文档查证的**：答案散在几份资料里 → Researcher 多路检索后再整合，而不是只翻到一段就答；
+2. **要查最新信息的**：模型版本、行业动向，本地库收录不了 → router 判断走联网，而不是硬答"未找到"；
+3. **要判断可信度的**：网上说法互相矛盾 → Reviewer 按"忠实于资料"审，防止把单一来源当全局结论。
+
+**凭什么是"能用的"，不是 demo**（证据都在下文，可复现）：
+
+- **有数字**：三档基线评测（同裁判同口径）完整链路 Context Recall 0.48→0.66、
+  Answer Relevancy 0.50→0.74，且只有它能答联网时效题 → 见「评测与基线对比」。
+- **能回归**：改一条检索策略就能一键重测（`python eval_baseline.py`），pytest + CI 全绿。
+- **不装完美**：评测章节如实标注"单次裁判有波动，看方向不看绝对值"——知道评估的边界，
+  不拿一个数字当真理。
+
+**技术底座**：LangGraph 多 Agent 编排 · Parent Document 混合检索（FAISS + BM25）·
+CrossEncoder 精排 · HyDE 假想答案 · MCP 工具 · FastAPI(SSE) + Streamlit · DeepSeek。
+细节见「核心特性」与「架构决策记录（ADR）」。
+
+> 📸 **演示位**：放一张"提问 → Researcher 调工具 → Reviewer 打回修订 → 出终稿"的截图或 GIF
+> （本地相对路径引用），30 秒看懂它在干什么。
 
 ---
 
@@ -162,7 +182,7 @@
 ## 目录结构
 
 ```
-lc_course/
+doc-intel/
 ├── main.py                    # 脚本入口：加载 docs → 建索引 → 跑多 Agent 图
 ├── multi_agent/               # 核心库
 │   ├── config.py              #   统一路径与配置（以项目根为基准）
@@ -236,7 +256,7 @@ LANGSMITH_TRACING=false
 
 在 `.env` 中把 `LANGSMITH_TRACING` 改为 `true` 并填入真实 `LANGSMITH_API_KEY`
 （[smith.langchain.com](https://smith.langchain.com) → Settings → API Keys，`lsv2_` 开头），
-`LANGSMITH_PROJECT` 建议改成 `lc-course`。不填 Key 或保持 `false`，程序静默关闭追踪，不影响任何功能。
+`LANGSMITH_PROJECT` 建议改成 `doc-intel`。不填 Key 或保持 `false`，程序静默关闭追踪，不影响任何功能。
 
 开启后，每次跑图（`main.py` / 后端流式对话）都会自动上报：每一步 LLM 的输入输出、token 消耗、
 Researcher 的工具调用、Reviewer 的审核结论。在 LangSmith 里可按 `run_name`（`multi_agent_rag` / `chat_stream`）筛选。

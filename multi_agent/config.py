@@ -18,7 +18,7 @@ LANGSMITH_TRACING = (
 )
 if LANGSMITH_TRACING:
     os.environ["LANGSMITH_TRACING"] = "true"
-    os.environ.setdefault("LANGSMITH_PROJECT", "lc-course")
+    os.environ.setdefault("LANGSMITH_PROJECT", "doc-intel")
     print("[LangSmith] ✅ 全链路追踪已开启 → https://smith.langchain.com")
 else:
     # 防呆：如果 .env 里开了开关却没填 Key，LangSmith 会一路告警刷屏，这里强制关掉。
