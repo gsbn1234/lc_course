@@ -14,7 +14,11 @@ HyDE（Hypothetical Document Embeddings，假想文档检索）
   Embedding 算的是语义方向而非事实准确度。
 """
 
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate
+
+logger = logging.getLogger(__name__)
 
 hyde_prompt = ChatPromptTemplate.from_template("""
 你是一个专业的技术文档写作者。
@@ -47,5 +51,5 @@ def generate_hypothetical_answer(rewrite_question: str, llm) -> str:
     chain = hyde_prompt | llm
     response = chain.invoke({"question": rewrite_question})
     hyde_answer = response.content.strip()
-    print(f"\n[HyDE] 假想答案已生成（{len(hyde_answer)} 字）: {hyde_answer[:80]}...")
+    logger.debug("HyDE 假想答案已生成（%d 字）: %s...", len(hyde_answer), hyde_answer[:80])
     return hyde_answer

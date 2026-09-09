@@ -1,7 +1,10 @@
 import hashlib
+import logging
 import jieba
 
 from .retriever import vector_search, bm25_search
+
+logger = logging.getLogger(__name__)
 
 
 def parent_hybrid_retrieve(
@@ -89,5 +92,5 @@ def parent_hybrid_retrieve(
         reverse=True
     )[:top_k]
 
-    print(f"[Parent] {len(parent_results)} parents → top{len(final_results)}")
+    logger.debug("[Parent] %d parents → top%d", len(parent_results), len(final_results))
     return final_results

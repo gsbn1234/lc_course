@@ -25,6 +25,7 @@
                 ▼
               [END]
 """
+import logging
 from typing import TypedDict, List   #自定义 LangGraph 全局状态的类型约束，规范状态字段类型；
 
 from langgraph.graph import StateGraph, START, END  #LangGraph 核心，构建状态图；START 起点、END 终点；
@@ -39,6 +40,8 @@ from .reranker import rerank, get_reranker
 from .context_compressor import compress_documents
 from .prompt import prompt as answer_prompt
 from .hyde import generate_hypothetical_answer
+
+logger = logging.getLogger(__name__)
 
 
 # ========== 1. 定义状态 ==========
@@ -118,7 +121,7 @@ def classify_route_node(state: RAGState, llm):
     输入 state["question"]，输出 state["route"]。
     """
     route = classify_route(state["question"], llm)
-    print(f"\n[Router] 问题分类: {route}")
+    logger.info("[Router] 问题分类: %s", route)
     return {"route": route}
 
 

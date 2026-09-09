@@ -22,6 +22,9 @@ import time
 from contextlib import redirect_stdout
 from datetime import date
 
+from multi_agent.logging_setup import setup_logging
+setup_logging("WARNING")
+
 from langchain_core.callbacks import BaseCallbackHandler
 from langchain_core.prompts import ChatPromptTemplate
 

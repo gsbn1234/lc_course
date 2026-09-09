@@ -1,6 +1,10 @@
+import logging
+
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 
 from .config import PDF_PATH
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -12,8 +16,6 @@ def load_documents():
 
     docs = loader.load()
 
-    print(
-        f"加载文档页数：{len(docs)}"
-    )
+    logger.info("加载文档页数：%d", len(docs))
 
     return docs

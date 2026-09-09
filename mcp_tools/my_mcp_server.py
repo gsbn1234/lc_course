@@ -11,10 +11,20 @@ MCP Server — 领域化工具注册。
 包名，重名会被 Python 优先 import 本地目录，导致 SDK 崩溃。
 """
 import datetime
+import logging
 import os
 import sys
 
 from mcp.server import FastMCP #导入官方 MCP‑SDK 的`FastMCP`服务端类；`FastMCP` 是高阶封装，快速创建 MCP 服务、注册工具、启动 stdio 通信。
+
+# MCP 子进程：stdout 是 JSON-RPC 协议通道，日志只能走 stderr。
+# basicConfig 须在业务模块 import 之前调用，否则工具日志没有 handler 会被丢。
+logging.basicConfig(
+    stream=sys.stderr,
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 # 确保 mcp_tools/tools/ 可以被导入（直接 python 运行时工作目录是项目根，可省略；
 # 显式加保险，避免从别的目录启动时找不到）

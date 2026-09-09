@@ -1,4 +1,8 @@
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -80,15 +84,8 @@ def generate_queries(
     queries=clean_queries[:num_queries]
 
 
-    print("\n===== Multi Query =====")
-
-    for i,q in enumerate(
-        queries,
-        1
-    ):
-        print(
-            f"{i}. {q}"
-        )
+    logger.debug("Multi Query 共 %d 条：\n%s", len(queries),
+                 "\n".join(f"{i}. {q}" for i, q in enumerate(queries, 1)))
 
 
     return queries

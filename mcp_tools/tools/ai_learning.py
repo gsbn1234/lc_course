@@ -12,10 +12,12 @@ AI 学习领域的真实 MCP 工具。
     （绝不走 stdout —— stdout 是 MCP 协议通道，一行 print 就会污染协议流）
   - 返回的是 LLM 友好的结构化文本，不是裸 JSON
 """
+import logging
 import os
-import sys
 
 import httpx #现代异步 / 同步 HTTP 客户端，代替 requests，这里发同步 GET 请求调用 GitHub 开放接口
+
+logger = logging.getLogger(__name__)
 
 # 全局统一的超时配置（秒）：外部 API 最慢 8 秒必须给结果
 _TIMEOUT = httpx.Timeout(8.0)
@@ -47,10 +49,10 @@ def search_github_repos(query: str, top_k: int = 5) -> str:
         resp.raise_for_status() #httpx 响应对象方法。
         items = resp.json().get("items", [])
     except httpx.TimeoutException:
-        print("[MCP][GitHub] 请求超时", file=sys.stderr)
+        logger.warning("GitHub 请求超时")
         return "GitHub 搜索超时，请稍后重试或改用网页搜索。"
     except Exception as e:
-        print(f"[MCP][GitHub] 搜索失败：{e}", file=sys.stderr)
+        logger.error("GitHub 搜索失败：%s", e)
         return f"GitHub 搜索失败：{type(e).__name__}: {e}"
 
     if not items:
@@ -89,10 +91,10 @@ def search_arxiv_papers(query: str, top_k: int = 5) -> str:
         root = ET.fromstring(resp.text)
         entries = root.findall("a:entry", ns)#查找根节点下面**所有 `<entry>` 标签**；每一个 entry 对应一篇论文。结果存入 entries 列表。
     except httpx.TimeoutException:
-        print("[MCP][arXiv] 请求超时", file=sys.stderr)
+        logger.warning("arXiv 请求超时")
         return "arXiv 搜索超时，请稍后重试或改用网页搜索。"
     except Exception as e:
-        print(f"[MCP][arXiv] 搜索失败：{e}", file=sys.stderr)
+        logger.error("arXiv 搜索失败：%s", e)
         return f"arXiv 搜索失败：{type(e).__name__}: {e}"
 
     if not entries:
@@ -143,10 +145,10 @@ def search_hf_models(query: str, top_k: int = 5) -> str:
             resp2.raise_for_status()
             models = resp2.json()
     except httpx.TimeoutException:
-        print("[MCP][HF] 请求超时", file=sys.stderr)
+        logger.warning("HuggingFace 请求超时")
         return "HuggingFace 搜索超时，请稍后重试或改用网页搜索。"
     except Exception as e:
-        print(f"[MCP][HF] 搜索失败：{e}", file=sys.stderr)
+        logger.error("HuggingFace 搜索失败：%s", e)
         return f"HuggingFace 搜索失败：{type(e).__name__}: {e}"
 
     if not models:

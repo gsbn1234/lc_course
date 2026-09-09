@@ -22,6 +22,13 @@ from fastapi.middleware.cors import CORSMiddleware #CORS 跨域中间件.浏览�
 from pydantic import BaseModel #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析
 from langchain_community.document_loaders import PyPDFLoader
 
+# 先于任何 multi_agent 模块导入配置日志：config.py 等 import 时就会打日志
+from multi_agent.logging_setup import setup_logging
+setup_logging()
+import logging
+
+logger = logging.getLogger(__name__)
+
 from multi_agent.parent_splitter import split_parent_child
 from multi_agent.embedding import get_embeddings
 from multi_agent.vector_db import get_vector_store
@@ -177,8 +184,7 @@ async def upload_pdf(
     except Exception as e:
         # 索引构建失败：返回 500 + 错误详情。
         # 之前直接抛 500 会让前端收到"没有 session_id 的 200"，前端会 KeyError。
-        import traceback
-        traceback.print_exc()
+        logger.exception("索引构建失败：%s: %s", type(e).__name__, e)
         raise HTTPException(status_code=500, detail=f"索引构建失败：{type(e).__name__}: {e}")
 
     # 8. 存进会话：重物落盘 + 元数据进 Redis + 内存缓存（三层，见 session_store）
@@ -277,9 +283,8 @@ async def chat_stream(req: ChatRequest):
             yield f"data: {json.dumps({'type': 'done', 'answer': answer}, ensure_ascii=False)}\n\n"#`ensure_ascii=False`：让中文正常显示，不会被转成 `\uXXXX`
         except Exception as e:
             # 关键修复：Agent 中途出错不再直接断连，而是把错误作为 SSE 事件发回前端
-            import traceback
-            traceback.print_exc()#`traceback.print_exc()`：在后端控制台打印完整报错堆栈，方便你排查 bug
-            err_msg = f"{type(e).__name__}: {e}"#`err_msg = f"{type(e).__name__}: {e}"`：组装错误信息，例如 `ValueError: 工具调用超时`
+            err_msg = f"{type(e).__name__}: {e}"
+            logger.exception("Agent 运行出错：%s", err_msg)
             yield f"data: {json.dumps({'type': 'error', 'message': err_msg}, ensure_ascii=False)}\n\n"
 
     return StreamingResponse(event_stream(), media_type="text/event-stream")

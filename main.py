@@ -2,6 +2,9 @@
 
 
 
+from multi_agent.logging_setup import setup_logging
+setup_logging()
+
 from multi_agent.loader import load_documents
 from multi_agent.parent_splitter import split_parent_child   # ← 替换原来的 splitter
 from multi_agent.embedding import get_embeddings

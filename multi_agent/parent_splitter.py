@@ -1,5 +1,9 @@
+import logging
+
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from langchain_core.documents import Document
+
+logger = logging.getLogger(__name__)
 
 
 def split_parent_child(docs, child_size=200, parent_size=800, overlap=50):
@@ -45,7 +49,6 @@ def split_parent_child(docs, child_size=200, parent_size=800, overlap=50):
             sub.metadata["parent_id"] = parent.metadata["parent_id"]   #split_documents 要求入参是列表，因此必须写[parent]，不能直接传 parent。
         child_docs.extend(sub_chunks)    # extend摊平，一维此时 child_docs是单个列表，里面是child_docs = [Document, Document, Document, ...]
                                         #append是会变成嵌套 [ [doc1,doc2], [doc3], ... ]
-    print(f"Parent chunks: {len(parent_docs)}")
-    print(f"Child chunks:  {len(child_docs)}")
+    logger.info("父子切分完成：Parent %d 块 / Child %d 块", len(parent_docs), len(child_docs))
 
     return child_docs, parent_docs

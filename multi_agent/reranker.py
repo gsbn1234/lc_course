@@ -1,5 +1,9 @@
+import logging
+
 from sentence_transformers import CrossEncoder
+
 reranker = None
+logger = logging.getLogger(__name__)
 
 
 def get_reranker():
@@ -87,7 +91,7 @@ def rerank(
     top_scores = ", ".join(
         f"{r['score']:.2f}" for r in results[:3]
     )
-    print(f"[Rerank] top-3 scores: {top_scores}")
+    logger.debug("[Rerank] top-3 scores: %s", top_scores)
 
     return results
 

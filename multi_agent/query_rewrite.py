@@ -1,4 +1,8 @@
+import logging
+
 from langchain_core.prompts import ChatPromptTemplate
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -49,11 +53,7 @@ def rewrite_query(
     rewritten = response.content.strip()
 
 
-    print("\n===== Query Rewrite =====")
-
-    print(
-        rewritten
-    )
+    logger.debug("改写后查询：%s", rewritten)
 
 
     return rewritten

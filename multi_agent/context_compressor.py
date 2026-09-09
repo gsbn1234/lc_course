@@ -1,5 +1,8 @@
+import logging
 import re            #导入正则表达式库，用于文本分句
 from copy import copy      #导入浅拷贝函数，用来复制 Document 文档对象，防止修改原始文档。
+
+logger = logging.getLogger(__name__)
 
 
 def split_sentences(text):
@@ -72,5 +75,5 @@ def compress_documents(query, docs, reranker, keep_ratio=0.5):
 
         # print(f"\n[Context Compression] 原 {len(sentences)} 句 → 保留 {keep_count} 句")
         # print(f"  压缩前 {len(text)} 字 → 压缩后 {len(compressed_text)} 字")
-    print(f"[Compress] {len(compressed)} docs compressed")
+    logger.debug("[Compress] %d docs compressed", len(compressed))
     return compressed

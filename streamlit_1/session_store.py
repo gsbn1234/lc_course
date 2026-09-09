@@ -25,6 +25,7 @@ Redis 会话存储 — 替代 backend.py 里的内存 sessions dict。
   信任边界：这些文件只由本应用写入。
 """
 import json
+import logging
 import os
 import pickle  # 仅用于兼容旧会话 .pkl 的迁移读取
 from collections import OrderedDict
@@ -40,15 +41,17 @@ from multi_agent.embedding import get_embeddings
 from multi_agent.llm import get_llm
 from multi_agent.multi_agent_graph import build_multi_agent_graph, load_mcp_tools
 
+logger = logging.getLogger(__name__)
+
 # Redis 连接：本地开发连 WSL2 里的 Redis（localhost 由 WSL2 自动转发）；
 # Docker 部署时 compose 注入 REDIS_HOST=redis，指向 redis 容器，代码不用改
 REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
 r = redis.Redis(host=REDIS_HOST, port=6379, decode_responses=True)
 try:
     r.ping()
-    print(f"[Redis] ✅ 已连接 {REDIS_HOST}:6379")
+    logger.info("Redis 已连接 %s:6379", REDIS_HOST)
 except redis.ConnectionError:
-    print(f"[Redis] ⚠️ 连不上 Redis（{REDIS_HOST}:6379），请先在 WSL 里启动：sudo service redis-server start")
+    logger.error("连不上 Redis（%s:6379），请先在 WSL 里启动：sudo service redis-server start", REDIS_HOST)
 
 SESSIONS_DIR = Path("faiss_db/sessions")  # 会话索引都放这里（faiss_db 已在 .gitignore）
 MAX_CACHED = 20                            # 内存最多缓存多少个重建好的会话
@@ -127,7 +130,7 @@ async def _rebuild(session_id, checkpointer, store):
         return None
 
     # 重启后第一次提问能看到这行，证明走的是"磁盘重建"路径而不是内存缓存
-    print(f"[Session] 从磁盘重建会话 {session_id}")
+    logger.info("从磁盘重建会话 %s", session_id)
     embeddings = get_embeddings()
     vector_store = FAISS.load_local(
         str(index_dir), embeddings, allow_dangerous_deserialization=True

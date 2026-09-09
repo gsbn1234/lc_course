@@ -1,8 +1,11 @@
 import os
+import logging
 from pathlib import Path
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logger = logging.getLogger(__name__)
 
 # ========== LangSmith 全链路追踪开关 ==========
 # 原理：LangChain/LangGraph 每次 run 开始时自动读环境变量，决定是否把轨迹上报到 LangSmith。
@@ -19,7 +22,7 @@ LANGSMITH_TRACING = (
 if LANGSMITH_TRACING:
     os.environ["LANGSMITH_TRACING"] = "true"
     os.environ.setdefault("LANGSMITH_PROJECT", "doc-intel")
-    print("[LangSmith] ✅ 全链路追踪已开启 → https://smith.langchain.com")
+    logger.info("LangSmith 全链路追踪已开启 → https://smith.langchain.com")
 else:
     # 防呆：如果 .env 里开了开关却没填 Key，LangSmith 会一路告警刷屏，这里强制关掉。
     # 没填 Key = 本地自测，静默跳过，功能完全不受影响。

@@ -2,8 +2,12 @@
 Tavily 网页搜索检索器。
 返回和 parent_hybrid_retrieve 相同的数据结构，保证后续节点可以无差别处理。
 """
+import logging
+
 from langchain_core.documents import Document
 from langchain_community.tools.tavily_search import TavilySearchResults
+
+logger = logging.getLogger(__name__)
 
 
 def web_search(question, k=5):
@@ -28,7 +32,7 @@ def web_search(question, k=5):
     #                      （见 langchain_community 的 TavilySearchResults._run），
     #                      也偶有 JSON 文本。此时联网失败，返回空让上游走本地检索兜底。
     if isinstance(raw_results, str):
-        print(f"\n[Web Search] Tavily 返回异常（{raw_results[:100]}），本次联网检索降级为空")
+        logger.warning("[Web Search] Tavily 返回异常（%s），本次联网检索降级为空", raw_results[:100])
         return []
     if isinstance(raw_results, dict):
         raw_results = raw_results.get("results", [])
@@ -50,5 +54,5 @@ def web_search(question, k=5):
             "score": 1.0      # 网页结果没有向量分数，统一给 1.0
         })
 
-    print(f"\n[Web Search] Tavily 返回 {len(docs)} 条结果")
+    logger.debug("[Web Search] Tavily 返回 %d 条结果", len(docs))
     return docs[:k]

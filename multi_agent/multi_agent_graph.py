@@ -24,6 +24,7 @@ Multi-Agent 协作系统 — Supervisor + Researcher + Writer。
 import os
 import sys
 import asyncio
+import logging
 from typing import TypedDict, Annotated, Literal
 import operator
 
@@ -48,6 +49,8 @@ from .parent_retriever import parent_hybrid_retrieve
 from .web_retriever import web_search
 from .reranker import rerank, get_reranker
 from .context_compressor import compress_documents
+
+logger = logging.getLogger(__name__)
 
 
 # ========== 1. 定义 State ==========
@@ -216,7 +219,7 @@ async def close_mcp():
         try:
             await _mcp_ctx["cm"].__aexit__(None, None, None)
         except Exception as e:
-            print(f"[MCP] 关闭连接时异常（可忽略）：{e}")
+            logger.warning("[MCP] 关闭连接时异常（可忽略）：%s", e)
         _mcp_ctx = None
 
 
@@ -247,10 +250,10 @@ async def load_mcp_tools(domain: str = "general"):
             ctx["session"], connection=ctx["connection"], server_name="mytools"
         )
         filtered = [t for t in tools if t.name in whitelist]#列表推导式做白名单过滤
-        print(f"[MCP] 领域 {domain} → 已加载 {len(filtered)} 个工具: {[t.name for t in filtered]}")
+        logger.info("[MCP] 领域 %s → 已加载 %d 个工具: %s", domain, len(filtered), [t.name for t in filtered])
         return filtered
     except Exception as e:
-        print(f"[MCP] 加载 MCP 工具失败，已跳过：{e}")
+        logger.warning("[MCP] 加载 MCP 工具失败，已跳过：%s", e)
         return []   # MCP 挂了不影响 RAG 主流程
 
 
@@ -290,7 +293,7 @@ def rewrite_query_node(state: MultiAgentState, llm,config:RunnableConfig,store:B
         pref = question.split("记住", 1)[-1].strip("：:，。、 ")#从字符串只分割 1 次。`[-1]`：取分割后**最后那一段**，也就是 “记住” 后面所有文字
         if pref:#`("users", user_id)` → namespace 命名空间，相当于文件夹：users 目录下，该用户的记忆。`"style"` → key，记忆条目的名字，代表「回答风格偏好」。`{"data": pref}` → 要保存的值，必须是字典格式
             store.put(("users", user_id), "style", {"data": pref})
-            print(f"\n[Memory] 已记住用户偏好：{pref}")
+            logger.info("[Memory] 已记住用户偏好：%s", pref[:80])
 
     # mcp_tool_guide 由 build_multi_agent_graph 构图时算好传入（见 build 函数）
     researcher_system = SystemMessage(content=f"""你是一个专职的信息研究员。
@@ -336,12 +339,12 @@ def supervisor_node(state: MultiAgentState) -> dict:
     next_agent = state.get("next_agent", "researcher")
 
     if next_agent == "researcher":
-        print("\n[Supervisor] → 派 Researcher 去搜索")
+        logger.info("[Supervisor] → 派 Researcher 去搜索")
         return {"next_agent": "researcher"}
 
     elif next_agent == "writer":
         # 打包 Researcher 的成果，交给 Writer
-        print("\n[Supervisor] → Researcher 搜完了，派 Writer 来写")
+        logger.info("[Supervisor] → Researcher 搜完了，派 Writer 来写")
 
 
 
@@ -380,7 +383,7 @@ def supervisor_node(state: MultiAgentState) -> dict:
         }
 
     else:  # finish
-        print("\n[Supervisor] → 任务完成")
+        logger.info("[Supervisor] → 任务完成")
         return {"next_agent": "finish"}
 
 
@@ -400,7 +403,7 @@ def researcher_agent_node(state: MultiAgentState, researcher_llm):
     if getattr(response, "tool_calls", None):
         max_rounds = state.get("max_tool_rounds", 5)
         if rounds >= max_rounds:
-            print(f"\n[Researcher] 已达最大搜索轮数 {max_rounds}，强制切换到 Writer")
+            logger.warning("[Researcher] 已达最大搜索轮数 %d，强制切换到 Writer", max_rounds)
 
             # ★ 关键：强制追加一条 HumanMessage，要求总结
             summary_prompt = HumanMessage(
@@ -522,7 +525,7 @@ def reviewer_agent_node(state: MultiAgentState, llm, max_review_rounds=2):
     rounds = state.get("review_rounds", 0)
     max_rounds = state.get("max_review_rounds", max_review_rounds)
 
-    print(f"\n[Reviewer] 第 {rounds + 1} 轮审核 → {verdict}")
+    logger.info("[Reviewer] 第 %d 轮审核 → %s", rounds + 1, verdict)
 
     # 不合格且未超上限：把修改意见作为一条 HumanMessage 追加给 Researcher，让它针对性重搜
     if verdict == "REVISE" and rounds < max_rounds:
@@ -605,7 +608,7 @@ async def researcher_tool_execute(state, researcher_tool_node):
         for k, v in args.items():
             s = str(v)
             short_args[k] = s[:80] + "..." if len(s) > 80 else s
-        print(f"\n[Researcher] {name}({short_args})")
+        logger.info("[Researcher] %s(%s)", name, short_args)
 
     result = await researcher_tool_node.ainvoke({"messages": messages})
     """

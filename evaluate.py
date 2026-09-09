@@ -20,6 +20,11 @@ import asyncio
 import io
 from contextlib import redirect_stdout
 
+# 评估脚本自带进度 print；图运行时的内部日志默认压到 WARNING（只看警告/错误），
+# 避免每条问题的 Agent 轨迹刷屏。想排查可临时改成 setup_logging("DEBUG")。
+from multi_agent.logging_setup import setup_logging
+setup_logging("WARNING")
+
 from multi_agent.loader import load_documents
 from multi_agent.parent_splitter import split_parent_child
 from multi_agent.embedding import get_embeddings

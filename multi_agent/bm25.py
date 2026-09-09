@@ -1,6 +1,10 @@
+import logging
+
 import jieba
 
 from rank_bm25 import BM25Okapi
+
+logger = logging.getLogger(__name__)
 
 
 
@@ -32,9 +36,7 @@ def create_bm25(chunks):
     )
 
 
-    print(
-        "BM索引建立完成"
-    )
+    logger.info("BM 索引建立完成（共 %d 块）", len(chunks))
 
 
     return bm25

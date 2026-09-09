@@ -6,6 +6,9 @@ HyDE 对比评估：关 vs 开，量化检索质量变化。
 import io
 from contextlib import redirect_stdout
 
+from multi_agent.logging_setup import setup_logging
+setup_logging("WARNING")
+
 from langchain_core.prompts import ChatPromptTemplate
 
 from multi_agent.loader import load_documents
