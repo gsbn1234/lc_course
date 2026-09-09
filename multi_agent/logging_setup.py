@@ -22,53 +22,73 @@
     setup_logging("DEBUG")     # 想看检索内部细节
     setup_logging("WARNING")   # 评估脚本：只要警告和错误
 
-级别也可用环境变量覆盖（参数优先级更高）：
+级别也可用环境变量覆盖（参数优先级更高，数字字符串也认）：
     LOG_LEVEL=DEBUG python main.py
 
-注意：必须在 import 业务模块（multi_agent.*、streamlit_1.*）之前调用，
-因为 config.py 等模块在 import 时就会打日志，先配 handler 才不丢。
+注意：
+  - 必须在 import 业务模块（multi_agent.*、streamlit_1.*）之前调用，
+    因为 config.py 等模块在 import 时就会打日志，先配 handler 才不丢。
+  - 进程内第一个调用生效（first-call-wins），后续调用直接返回；
+    想排障时临时提级，重启进程并设 LOG_LEVEL=DEBUG 即可。
+  - 锁只保证「本进程内多线程」不重复挂 handler；logging 是进程级的，
+    跨进程各配各的，不存在也不需要一个全局跨进程锁。
 """
 import logging
 import os
 import sys
+import threading
 
-_configured = False  # 幂等：入口之间互相 import 时，重复调用不重复挂 handler
+_configured = False              # 进程内是否已挂过 handler
+_lock = threading.Lock()         # 线程安全：并发调用也只配置一次
 
 
-def setup_logging(level=None, log_file=None):
-    """配置一次根日志器。重复调用安全（第二次起直接返回）。"""
-    global _configured
-    if _configured:
-        return
-
-    # 级别优先级：显式参数 > LOG_LEVEL 环境变量 > INFO
+def _resolve_level(level):
+    """把 显式参数 / LOG_LEVEL 环境变量 / 数字字符串 归一成 logging 级别 int。"""
     if level is None:
         level = os.getenv("LOG_LEVEL", "INFO")
     if isinstance(level, int):
-        numeric = level
-    else:
-        numeric = logging.getLevelName(str(level).upper())
-        if not isinstance(numeric, int):     # 写错级别名（如 LOG_LEVEL=verbose）
-            numeric = logging.INFO
+        return level
+    s = str(level).strip().upper()
+    try:
+        return int(s)            # "15" / "20" 这类数字字符串也认
+    except ValueError:
+        pass
+    numeric = logging.getLevelName(s)      # "INFO"/"DEBUG"/"WARN" → int
+    if not isinstance(numeric, int):       # 级别名写错（如 verbose）→ 兜底 INFO
+        return logging.INFO
+    return numeric
 
-    root = logging.getLogger()
-    root.setLevel(numeric)
 
-    # MCP server 子进程可能已用 logging.basicConfig 配好 handler（也是 stderr），
-    # root 已有 handler 就不再重复挂，只统一级别。
-    if not root.handlers:
+def setup_logging(level=None, log_file=None):
+    """进程入口调用一次：定死级别、把日志出口接到 stderr。
+
+    幂等 + 线程安全：handler 只挂一次；级别以第一个调用为准。
+    """
+    global _configured
+    with _lock:
+        if _configured:
+            return
+
+        numeric = _resolve_level(level)
+
+        root = logging.getLogger()
+        root.setLevel(numeric)
+
         fmt = logging.Formatter(
             "%(asctime)s | %(levelname)-7s | %(name)s | %(message)s",
-            datefmt="%H:%M:%S",
+            datefmt="%m-%d %H:%M:%S",        # 服务日志跨天，带日期才好定位
         )
-        handler = logging.StreamHandler(sys.stderr)   # 一律 stderr，绝不 stdout
-        handler.setFormatter(fmt)
-        handler.setLevel(numeric)
-        root.addHandler(handler)
+        # 判重用 type 精确匹配：FileHandler 也是 StreamHandler 的子类，
+        # 若用 isinstance 判断，已挂文件 handler 时会误判"有控制台 handler"
+        # 而漏挂 stderr，导致控制台静音。
+        if not any(type(h) is logging.StreamHandler for h in root.handlers):
+            sh = logging.StreamHandler(sys.stderr)   # 一律 stderr，绝不 stdout
+            sh.setFormatter(fmt)
+            root.addHandler(sh)
 
-        if log_file:                               # 本地脚本想留档时可选，默认不写文件
-            fh = logging.FileHandler(log_file, encoding="utf-8")
+        if log_file and not any(isinstance(h, logging.FileHandler) for h in root.handlers):
+            fh = logging.FileHandler(log_file, encoding="utf-8")   # 可选留档
             fh.setFormatter(fmt)
             root.addHandler(fh)
 
-    _configured = True
+        _configured = True
