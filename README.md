@@ -284,6 +284,16 @@ CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去�
 - Redis 或索引目录出问题 → `status: "error"`，HTTP **503**（硬依赖挂了，该把流量摘走）。
 - 只有 MCP 出问题 → `status: "degraded"`，HTTP 仍是 **200**（工具降级会自动退回纯本地检索，不该因此把整个服务判死）。`not_started` 是懒加载的正常初始态，不算降级。
 
+**接口文档：<http://127.0.0.1:8000/docs>**
+
+后端启动后就有 Swagger UI，不用读源码就能试接口。三个接口的响应都用 Pydantic 响应模型声明过
+（`UploadResponse` / `HealthResponse` / `ComponentCheck`），所以文档里的字段名、类型、取值集合
+（`status` 只能是 `ok`/`degraded`/`error`）以及 `401`/`404`/`413`/`503` 各状态码的含义都是自动生成的，
+改了代码文档跟着变。
+
+`/api/chat-stream` 是唯一的例外：它是 SSE 长连接，响应体不是"一次成形的一个 JSON 对象"，
+`response_model` 那套前提不成立，所以它的事件契约（6 种 `type`）写在 `responses` 里。
+
 ### 3. 启用 LangSmith 追踪（可选）
 
 在 `.env` 中把 `LANGSMITH_TRACING` 改为 `true` 并填入真实 `LANGSMITH_API_KEY`

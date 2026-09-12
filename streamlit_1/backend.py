@@ -11,6 +11,7 @@ FastAPI 后端 — 把 Multi-Agent 系统封装成 REST API。
 """
 
 import asyncio #事件循环里不能跑同步阻塞活：用 asyncio.to_thread 把它丢进线程池，期间事件循环继续处理别的请求
+from contextlib import asynccontextmanager #lifespan 就是个 async context manager：yield 前是启动、后是关停
 import os
 import secrets #API Key 用 secrets.compare_digest 做常量时间比较，避免定时攻击
 import shutil #用于递归清理临时目录（try/finally 保证出错也会删干净）
@@ -21,7 +22,8 @@ import tempfile #创建操作系统临时文件夹，接收上传 PDF、加载�
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, Response #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件；`Form`：接收非文件表单字段（如领域）。`Depends`：把鉴权函数挂成路由依赖；`Header`：读取请求头；`Response`：健康检查里动态改状态码
 from fastapi.responses import StreamingResponse #StreamingResponse:返回流式响应，适配 SSE 长连接，可以循环 yield 不断向前端发送消息，适合 LLM 流式输出、Agent 运行日志推送
 from fastapi.middleware.cors import CORSMiddleware #CORS 跨域中间件.浏览器同源策略：网页域名、端口和后端不一致就会拦截请求；你的 Streamlit 默认端口 8501，FastAPI 端口 8000，端口不同属于跨域，必须开启 CORS。
-from pydantic import BaseModel, field_validator #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析。field_validator：给单个字段挂自定义校验规则
+from pydantic import BaseModel, ConfigDict, field_validator #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析。field_validator：给单个字段挂自定义校验规则。ConfigDict：模型级配置（这里用 extra="allow" 放行未知字段）
+from typing import Literal #响应模型里把取值集合钉死（status 只能是 ok/degraded/error）
 from langchain_community.document_loaders import PyPDFLoader
 
 # 先于任何 multi_agent 模块导入配置日志：config.py 等 import 时就会打日志
@@ -36,7 +38,7 @@ from multi_agent.embedding import get_embeddings
 from multi_agent.vector_db import get_vector_store
 from multi_agent.bm25 import create_bm25
 from multi_agent.llm import get_llm
-from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools, mcp_status
+from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools, mcp_status, close_mcp
 
 from langgraph.store.memory import InMemoryStore
 
@@ -54,14 +56,34 @@ except ImportError:
     checkpointer = None   # 没装 langgraph-checkpoint-sqlite 就退回内存版，不报错
 
 
-app = FastAPI(title="Adaptive Research Agent API")
-
-
-# 应用关停时关闭全局 MCP 子进程，干净退出（不关的话挂在 asyncio 清理上会报噪音错误）
-@app.on_event("shutdown")
-async def _shutdown_mcp():
-    from multi_agent.multi_agent_graph import close_mcp
+# ========== 应用生命周期 ==========
+# 原先用 @app.on_event("shutdown")，FastAPI 已弃用这套（pytest 里会打
+# DeprecationWarning，指向文档的 Lifespan Events）。lifespan 是它的正式替代：
+# 一个 async context manager，yield 之前是启动、之后是关停。
+#
+# 相比 on_event 的实际好处：启动和关停写在同一个函数作用域里，启动时打开的资源
+# 可以直接用局部变量传给关停段；on_event 得拆成两个互不相干的函数，中间只能靠
+# 模块级全局变量传递，共享的东西一多就散。另外 lifespan 能拿到 app 实例（on_event
+# 的回调不接参数），要往 app.state 上挂东西也只能用它。
+#
+# 注意定义顺序：lifespan 必须在 FastAPI(...) 之前定义好并作为参数传进去，
+# 这正是 on_event 装饰器写法最容易踩的坑——它是"后注册"，所以能写在 app 之后。
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # ---- 启动 ----
+    # 这里目前没有要预热的：MCP 是懒加载的（等第一个带 domain 的会话来才拉起子进程），
+    # 模型和 Redis 连接都在各自模块 import 时就绪。留一行日志是为了在日志里
+    # 标出进程重启的边界——排查"重启后第一次提问为什么慢"时能一眼看到分界。
+    logger.info("后端启动：接口 %s", "已鉴权" if API_KEY else "无鉴权（本地开发）")
+    yield
+    # ---- 关停 ----
+    # 关掉全局 MCP 子进程。不关的话它会挂在 asyncio 的事件循环清理上，
+    # 退出时刷一堆噪音错误，盖掉真正的报错。
     await close_mcp()
+    logger.info("后端已关停")
+
+
+app = FastAPI(title="Adaptive Research Agent API", lifespan=lifespan)
 
 # CORS：允许 Streamlit 前端（8501 端口）跨域调用后端（8000 端口）
 app.add_middleware(
@@ -124,6 +146,9 @@ from streamlit_1.session_store import (
 
 
 # ========== 请求/响应模型 ==========
+# 响应模型不只是文档：声明了它，FastAPI 会把返回值按模型校验一遍再序列化，
+# 于是"字段名拼错 / 类型写错"这类静默 bug 会当场变成 500，而不是让前端
+# 悄悄拿到 undefined。代价是多一次 序列化 → 校验 → 再序列化，字段少时可忽略。
 
 class ChatRequest(BaseModel):
     session_id: str
@@ -151,6 +176,46 @@ class ChatRequest(BaseModel):
     #如果前端传参类型错误，FastAPI 自动返回报错，不需要手写 if 判断参数类型
 
 
+class UploadResponse(BaseModel):
+    """上传接口的响应。前端 app.py 就按这几个字段取值（data["child_chunks"] 等），
+    所以字段名是前后端之间的契约，不是随便起的。"""
+    session_id: str          # 后续对话接口必须带上它
+    page_count: int          # 解析出的 PDF 总页数（不是文件数）
+    child_chunks: int        # 子块数：进向量库 + BM25 的粒度
+    parent_chunks: int       # 父块数：命中后真正喂给 LLM 的粒度
+    domain: str              # 回显实际生效的领域（决定挂了哪些 MCP 工具）
+
+
+class ComponentCheck(BaseModel):
+    """单个依赖的探测结果。
+
+    三个探测器带的字段不完全一样（redis 多带 active_sessions，session_dir 多带
+    path，出错时都多带 detail），所以这里把已知字段全声明成可选——/docs 里一眼
+    能看出每个组件可能报出什么。
+
+    extra="allow" 是刻意的：以后某个探测器多返回一个字段（比如 latency_ms），
+    response_model 默认会把**没声明的字段静默剥掉**——数据在 API 层凭空消失，
+    且没有任何报错。allow 让未知字段原样透传，声明只管文档、不管过滤。
+    """
+    model_config = ConfigDict(extra="allow")
+
+    # 取值不是一套：redis 是 ok/error，mcp 是 connected/not_started/error，
+    # checkpointer 是 ok/disabled。所以这里用 str 而不是 Literal——
+    # 健康检查最不该因为"某个探测词表变了"把自己变成 500。
+    status: str
+    detail: str | None = None
+    path: str | None = None
+    active_sessions: int | None = None
+
+
+class HealthResponse(BaseModel):
+    """整体状态。这个集合是封闭的，用 Literal 把取值钉死，
+    /docs 里直接渲染成下拉可选项。"""
+    status: Literal["ok", "degraded", "error"]
+    checks: dict[str, ComponentCheck]     # 键是组件名，值是各自的探测结果
+    active_sessions: int | None = None    # Redis 挂了就探不到，为 null 而不是编一个
+
+
 # ========== 上传安全限制 ==========
 MAX_FILES = 5                      # 单次最多上传文件数
 MAX_FILE_SIZE = 20 * 1024 * 1024   # 单个文件最大 20MB
@@ -159,7 +224,7 @@ MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 单次上传总量上限 50MB
 
 # ========== 接口 1：上传 PDF + 建索引 ==========
 
-@app.post("/api/upload-pdf", dependencies=[Depends(verify_api_key)])
+@app.post("/api/upload-pdf", response_model=UploadResponse, dependencies=[Depends(verify_api_key)])
 async def upload_pdf(
     files: list[UploadFile] = File(...),
     domain: str = Form("general"),
@@ -287,16 +352,47 @@ async def upload_pdf(
 
 # ========== 接口 2：流式对话（核心） ==========
 
-@app.post("/api/chat-stream", dependencies=[Depends(verify_api_key)])
+@app.post(
+    "/api/chat-stream",
+    dependencies=[Depends(verify_api_key)],
+    # 这个接口没有 response_model，也不可能有：返回的是 SSE 长连接，
+    # 响应体是一串不断追加的事件帧，不是"一次成形的一个 JSON 对象"，
+    # response_model 那套"校验完整返回值"的前提在这里不成立。
+    # 事件契约改用 responses 写进 /docs（否则文档里只有一行 text/event-stream）。
+    # 注意：下面这段和函数自己 docstring 里的清单是同一份契约的两处副本，
+    # 增删事件类型时两边都要改（和 app.py 里 DOMAIN_MAP 那个同步提醒同理）。
+    responses={
+        200: {
+            "description": "SSE 流。每帧形如 `data: {...}\\n\\n`，事件类型：\n\n"
+                           "- `status`：Agent 进度，带 agent/rounds\n"
+                           "- `writer_start`：新一轮写作开始（Reviewer 打回时会再次出现）\n"
+                           "- `token`：答案分片，逐字追加做打字机效果\n"
+                           "- `tool_call`：Researcher 调了哪个工具、参数是什么\n"
+                           "- `done`：终稿。**前端要用它覆盖前面流式拼出来的内容**\n"
+                           "- `error`：中途失败，带 message\n",
+            "content": {
+                "text/event-stream": {
+                    "example": 'data: {"type": "status", "agent": "researcher", "rounds": 1}\n\n'
+                               'data: {"type": "token", "content": "RAG 是"}\n\n'
+                               'data: {"type": "done", "answer": "RAG 是检索增强生成……"}\n\n'
+                }
+            },
+        },
+        404: {"description": "session_id 不存在（没上传 PDF，或已被清理）"},
+    },
+)
 async def chat_stream(req: ChatRequest):
     """
     流式对话接口，返回 SSE（Server-Sent Events）。
 
-    每条事件的格式：
-      {"type": "status", "agent": "researcher", "rounds": 1}
-      {"type": "status", "agent": "writer"}
-      {"type": "tool_call", "name": "local_search", "args": {...}}
-      {"type": "done", "answer": "最终回答..."}
+    每条事件的格式（完整清单，/docs 里的 responses 是同一份契约）：
+      {"type": "status",       "agent": "researcher", "rounds": 1}
+      {"type": "status",       "agent": "writer"}
+      {"type": "writer_start"}                          # Reviewer 打回重写时会再次出现
+      {"type": "token",        "content": "分片"}
+      {"type": "tool_call",    "name": "local_search", "args": {...}}
+      {"type": "done",         "answer": "最终回答..."}  # 终稿，覆盖流式拼出的内容
+      {"type": "error",        "message": "..."}
     """
     #Pydantic 模型 — ChatRequest 类（第 49-51 行）自动校验请求体。如果前端少传了 session_id 或类型不对，FastAPI 自动返回 422 错误，不需要手写校验逻辑。
     if not req.question or len(req.question) > 2000:
@@ -373,7 +469,16 @@ async def chat_stream(req: ChatRequest):
 
 # ========== 接口 3：健康检查 ==========
 
-@app.get("/api/health")
+@app.get(
+    "/api/health",
+    response_model=HealthResponse,
+    # 没值的字段整个不出现，而不是铺一地 "detail": null —— 健康检查的输出
+    # 经常是人在看（curl 一下），干净比完整重要。
+    response_model_exclude_none=True,
+    # 503 是正常业务路径（Redis 挂了就是这样），不是异常。声明进 responses
+    # 才会出现在 /docs 里，调用方不用读源码就知道要处理这个状态码。
+    responses={503: {"model": HealthResponse, "description": "硬依赖（Redis 或索引目录）不可用"}},
+)
 async def health(response: Response):
     """逐个探测依赖，如实报告是谁挂了。
 

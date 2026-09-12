@@ -1,16 +1,18 @@
-"""接口鉴权 + 健康检查的依赖探测测试。
+"""应用级接线的测试：接口鉴权、健康检查的依赖探测、生命周期钩子。
 
-背景（两件事）：
+背景（三件事）：
   1. 没有鉴权。CORS 只锁来源，它约束的是浏览器；curl / requests 直接打 :8000
      完全绕开，谁都能上传 PDF、跑 Agent、烧 token。加一层 API Key。
   2. /api/health 不查依赖。原来固定返回 {"status": "ok"}，Redis 挂了照样说 ok，
      探活方被蒙在鼓里。合格的健康检查要逐个报告组件状态。
+  3. 关停钩子用的是已弃用的 @app.on_event("shutdown")，换成 lifespan。
 
 这里锁死的行为：
   · 没配 Key → 放行（本地开发默认）；配了 Key → 不带/带错都是 401
   · Bearer 和 X-API-Key 两种头都认
   · /api/health 不需要鉴权（探针没凭据，要鉴权的话探针永远 401）
   · Redis / 索引目录挂了 → 503；只有 MCP 出问题 → degraded 但仍是 200
+  · 关停时真的会去 close_mcp（这类钩子漏挂平时没症状，只有退出时才看得出来）
 
 不碰网络、不碰真 Redis：外部依赖全换成桩。
 """
@@ -156,7 +158,9 @@ def test_health_503_when_redis_down(tmp_path):
     body = resp.json()
     assert body["status"] == "error"
     assert "refused" in body["checks"]["redis"]["detail"]
-    assert body["active_sessions"] is None      # 探不到就没有这个数，不编一个
+    # 探不到会话数就不给这个字段，而不是编一个 0。
+    # 用 .get()：响应模型开了 exclude_none，为 None 的字段整个不出现（不是 null）。
+    assert body.get("active_sessions") is None
 
 
 def test_health_503_when_session_dir_missing(tmp_path):
@@ -200,3 +204,102 @@ def test_health_redis_probe_failure_is_reported_not_raised():
         status = backend.redis_status()
     assert status["status"] == "error"
     assert "ConnectionError" in status["detail"]
+
+
+# ========== 三、应用生命周期（lifespan） ==========
+
+def test_shutdown_closes_mcp():
+    """关停时要真的去关 MCP 子进程。
+
+    坑：直接 `TestClient(app)` 不会跑 lifespan，必须用 `with TestClient(app)`。
+    退出 with 块就等于走了一遍关停，所以断言写在 with 外面。
+    """
+    called = []
+
+    async def fake_close():
+        called.append(True)
+
+    with patch.object(backend, "close_mcp", fake_close):
+        with TestClient(backend.app):
+            pass
+    assert called, "关停时没关 MCP 子进程——它会挂在事件循环清理上刷噪音错误"
+
+
+def test_lifespan_is_wired_into_the_app():
+    """关停逻辑得真的挂上去。这类钩子漏挂平时完全没症状，
+    只有退出时才发现（而且报的是子进程相关的噪音错误，很难联想到钩子没挂）。"""
+    assert backend.app.router.lifespan_context is backend.lifespan, (
+        "app 没用上我们自己定义的 lifespan——关停钩子等于没挂"
+    )
+    assert not backend.app.router.on_shutdown, (
+        "还有 @app.on_event 注册的钩子——已弃用的写法没清干净"
+    )
+
+
+# ========== 四、响应模型（response_model） ==========
+
+def _openapi():
+    return TestClient(backend.app).get("/openapi.json").json()
+
+
+def _json_schema_ref(spec, path, method, status="200"):
+    return (
+        spec["paths"][path][method]["responses"][status]
+        ["content"]["application/json"]["schema"]
+    )
+
+
+def test_upload_response_model_is_declared():
+    """漏掉 response_model 时 /docs 里响应是空的，前端只能靠读源码猜字段名。
+    这条断言读的是自动生成的 OpenAPI，等于在验证"文档里真的有这个契约"。"""
+    spec = _openapi()
+    assert "UploadResponse" in spec["components"]["schemas"]
+    assert _json_schema_ref(spec, "/api/upload-pdf", "post")["$ref"].endswith(
+        "/UploadResponse"
+    )
+
+
+def test_health_declares_503_in_openapi():
+    """503 是 Redis 挂了的正常业务路径，调用方得能从文档知道要处理它。"""
+    spec = _openapi()
+    responses = spec["paths"]["/api/health"]["get"]["responses"]
+    assert "200" in responses and "503" in responses
+
+
+def test_chat_stream_documents_its_sse_events():
+    """SSE 用不了 response_model，事件契约只能靠 responses 写进文档。
+    否则 /docs 里这个接口的响应只有一行 text/event-stream，什么都没说。"""
+    spec = _openapi()
+    desc = spec["paths"]["/api/chat-stream"]["post"]["responses"]["200"]["description"]
+    for event in ("status", "writer_start", "token", "tool_call", "done", "error"):
+        assert event in desc, f"/docs 里没说明 {event} 事件"
+
+
+def test_unknown_check_fields_are_not_stripped(tmp_path):
+    """探测器以后多返回一个字段，不能被 response_model 静默吃掉。
+
+    这是给 ComponentCheck 配 extra="allow" 的原因：response_model 默认会把
+    模型里没声明的字段剥掉，而且不报错——数据在 API 层凭空消失最难查。
+    """
+    resp = _health(
+        redis={"status": "ok", "active_sessions": 1, "latency_ms": 7},
+        mcp={"status": "connected"},
+        sessions_dir=tmp_path,
+    )
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["checks"]["redis"]["latency_ms"] == 7, (
+        "未声明的字段被剥掉了——extra='allow' 没生效"
+    )
+
+
+def test_health_omits_absent_fields_instead_of_nulling_them(tmp_path):
+    """开了 exclude_none：没值的字段整个不出现，不铺一地 "detail": null。
+    健康检查的输出经常是人 curl 一下直接看的，干净比完整重要。"""
+    body = _health(
+        redis={"status": "ok", "active_sessions": 2},
+        mcp={"status": "not_started"},
+        sessions_dir=tmp_path,
+    ).json()
+    assert body["checks"]["redis"] == {"status": "ok", "active_sessions": 2}
+    assert "detail" not in body["checks"]["redis"]
+    assert "path" not in body["checks"]["mcp"]
