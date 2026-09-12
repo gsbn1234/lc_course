@@ -20,7 +20,7 @@ import tempfile #创建操作系统临时文件夹，接收上传 PDF、加载�
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件；`Form`：接收非文件表单字段（如领域）
 from fastapi.responses import StreamingResponse #StreamingResponse:返回流式响应，适配 SSE 长连接，可以循环 yield 不断向前端发送消息，适合 LLM 流式输出、Agent 运行日志推送
 from fastapi.middleware.cors import CORSMiddleware #CORS 跨域中间件.浏览器同源策略：网页域名、端口和后端不一致就会拦截请求；你的 Streamlit 默认端口 8501，FastAPI 端口 8000，端口不同属于跨域，必须开启 CORS。
-from pydantic import BaseModel #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析
+from pydantic import BaseModel, field_validator #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析。field_validator：给单个字段挂自定义校验规则
 from langchain_community.document_loaders import PyPDFLoader
 
 # 先于任何 multi_agent 模块导入配置日志：config.py 等 import 时就会打日志
@@ -88,6 +88,24 @@ class ChatRequest(BaseModel):
     session_id: str
     question: str
     max_tool_rounds: int = 5
+    # 长期记忆的隔离键：图里用它做 Store 命名空间 ("users", user_id)，
+    # 不同 user_id 的偏好互不可见（multi_agent_graph.py 里读、写各一处）。
+    # 故意不给默认值：一旦有默认值，"忘了传"的调用方就会悄悄退回共用命名空间，
+    # 也就是之前写死 "21702" 那个「所有人共享一份记忆」的老 bug。
+    user_id: str
+
+    @field_validator("user_id")
+    @classmethod
+    def _check_user_id(cls, v: str) -> str:
+        # 这个值会被直接当成 Store 的命名空间键：留着首尾空格会造出
+        # "alice" 和 "alice " 两个看起来一样、实际互不相通的用户。
+        v = v.strip()
+        if not v:
+            raise ValueError("user_id 不能为空")
+        if len(v) > 64:
+            raise ValueError("user_id 不能超过 64 个字符")
+        return v
+
     #FastAPI 接收 POST 请求 json 体依靠`BaseModel`
     #如果前端传参类型错误，FastAPI 自动返回报错，不需要手写 if 判断参数类型
 
@@ -252,10 +270,12 @@ async def chat_stream(req: ChatRequest):
 
     async def event_stream():
         result = None
-        # 多轮记忆的关键：thread_id = 会话 ID
-        # 同一个 session 的多次提问用同一个 thread，记忆就串起来了
+        # 两个记忆维度，别搞混：
+        #   thread_id = 会话 ID → 多轮对话记忆（同一 session 的多次提问串起来）
+        #   user_id   = 长期记忆命名空间 → 跨会话的偏好记忆（"记住xxx"存这里）
+        # user_id 由请求方提供，不再写死：写死等于所有用户共用一份偏好。
         config = {
-            "configurable": {"thread_id": req.session_id, "user_id": "21702"},
+            "configurable": {"thread_id": req.session_id, "user_id": req.user_id},
             # 给 LangSmith 用的轨迹标识：后端每轮对话生成独立 run，
             # 按 run_name=chat_stream + tag=web 就能在 smith 里筛出线上请求。
             "run_name": "chat_stream",

@@ -11,6 +11,7 @@ Streamlit 前端 — 前后端分离版。
 import os
 import requests #Python 最常用 HTTP 请求库，用来调用 FastAPI 接口，上传文件、发起对话、接收流式返回；
 import json
+import uuid #生成长期记忆的身份标识（user_id）
 import streamlit as st #`streamlit as st`：网页 UI 框架。
 
 # 本地开发默认 127.0.0.1:8000；Docker 里 compose 注入 BACKEND_URL=http://backend:8000
@@ -32,6 +33,12 @@ st.set_page_config(page_title="Adaptive Research Agent")
 if "initialized" not in st.session_state:
     st.session_state.session_id = None
     st.session_state.messages = []
+    # 长期记忆的身份：每个浏览器会话生成一个，随对话请求发给后端。
+    # 后端拿它当 Store 命名空间，不同身份的记忆互不可见——这样"记住xxx"
+    # 不会串到别人身上。放 session_state 里 → 同一次浏览器会话内保持不变
+    # （刷新页面会重新生成、换一份新记忆；想跨刷新沿用同一份，就把它换成
+    # 侧边栏里让用户自己填的名字）。
+    st.session_state.user_id = f"web-{uuid.uuid4().hex[:8]}"
     st.session_state.initialized = True
 
 # ========== 2. 侧边栏：上传 PDF + 参数配置 ==========
@@ -104,6 +111,10 @@ with st.sidebar:
     else:
         st.warning("⚠️ 请上传 PDF 并构建索引")
 
+    # 把记忆身份显示出来，便于验证隔离效果：
+    # 换个浏览器（或刷新页面）就是一个新身份，之前"记住"的偏好读不到了。
+    st.caption(f"🧠 记忆身份：{st.session_state.user_id}")
+
 # ========== 3. 主区域 ==========
 st.title("Adaptive Research Agent")
 st.caption("Multi-Agent 协作检索系统 — Supervisor + Researcher + Writer")
@@ -140,6 +151,7 @@ if prompt:
                         "session_id": st.session_state.session_id,
                         "question": prompt,
                         "max_tool_rounds": max_rounds,
+                        "user_id": st.session_state.user_id,   # 长期记忆的身份
                     },
                     stream=True,
                     timeout=120,

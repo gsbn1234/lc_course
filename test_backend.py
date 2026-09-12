@@ -58,7 +58,10 @@ print()
 
 resp = requests.post(
     f"{BASE}/api/chat-stream",
-    json={"session_id": session_id, "question": question, "max_tool_rounds": 5},
+    # user_id 是必填的（长期记忆的隔离键）。这里换个值就能验证隔离：
+    # 用同一个 user_id 先问"记住我喜欢简洁回答"，再从别的 user_id 问，读不到该偏好。
+    json={"session_id": session_id, "question": question,
+          "max_tool_rounds": 5, "user_id": "smoke-test"},
     stream=True,
 )
 
