@@ -17,6 +17,12 @@ import streamlit as st #`streamlit as st`：网页 UI 框架。
 # 本地开发默认 127.0.0.1:8000；Docker 里 compose 注入 BACKEND_URL=http://backend:8000
 BACKEND = os.getenv("BACKEND_URL", "http://127.0.0.1:8000")
 
+# 后端开了鉴权（BACKEND_API_KEY）时，前端得带上同一个 Key，否则会被 401 挡在门外。
+# 两个服务读的是同一个变量，compose 里用 env_file / environment 各注入一次。
+API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
+# 鉴权头：没配 Key 就不发这个头（后端那边同步也是"没配就不校验"，两边行为一致）
+AUTH_HEADERS = {"Authorization": f"Bearer {API_KEY}"} if API_KEY else {}
+
 # 领域代码 → 中文名（下拉框和上传成功提示共用这一份，只改这里）
 # 注意：后端 mcp_tools/registry.py 里也有一份 DOMAIN_LABELS（它给 registry 用），
 # 两侧各自维护，增领域时记得两边同步。
@@ -88,6 +94,7 @@ with st.sidebar:
                         f"{BACKEND}/api/upload-pdf",
                         files=files,
                         data={"domain": domain},   # 领域：决定挂哪些 MCP 工具
+                        headers=AUTH_HEADERS,
                     )
                     if resp.status_code == 200:
                         data = resp.json()
@@ -153,6 +160,7 @@ if prompt:
                         "max_tool_rounds": max_rounds,
                         "user_id": st.session_state.user_id,   # 长期记忆的身份
                     },
+                    headers=AUTH_HEADERS,
                     stream=True,
                     timeout=120,
                 )

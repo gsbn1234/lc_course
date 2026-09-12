@@ -12,12 +12,13 @@ FastAPI 后端 — 把 Multi-Agent 系统封装成 REST API。
 
 import asyncio #事件循环里不能跑同步阻塞活：用 asyncio.to_thread 把它丢进线程池，期间事件循环继续处理别的请求
 import os
+import secrets #API Key 用 secrets.compare_digest 做常量时间比较，避免定时攻击
 import shutil #用于递归清理临时目录（try/finally 保证出错也会删干净）
 
 import uuid #生成唯一会话 id，每个上传 PDF 的用户拥有独立知识库
 import json #序列化字典字符串，SSE 传输的数据必须为 JSON 字符串
 import tempfile #创建操作系统临时文件夹，接收上传 PDF、加载文档，用完立刻清理，不占用磁盘
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件；`Form`：接收非文件表单字段（如领域）
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header, Response #`UploadFile`：FastAPI 封装的上传文件对象，包含文件名、二进制内容。`File`：用来声明接口参数是上传文件；`Form`：接收非文件表单字段（如领域）。`Depends`：把鉴权函数挂成路由依赖；`Header`：读取请求头；`Response`：健康检查里动态改状态码
 from fastapi.responses import StreamingResponse #StreamingResponse:返回流式响应，适配 SSE 长连接，可以循环 yield 不断向前端发送消息，适合 LLM 流式输出、Agent 运行日志推送
 from fastapi.middleware.cors import CORSMiddleware #CORS 跨域中间件.浏览器同源策略：网页域名、端口和后端不一致就会拦截请求；你的 Streamlit 默认端口 8501，FastAPI 端口 8000，端口不同属于跨域，必须开启 CORS。
 from pydantic import BaseModel, field_validator #Pydantic 数据校验模型；FastAPI 依靠 BaseModel 自动校验前端传参类型、做参数解析。field_validator：给单个字段挂自定义校验规则
@@ -35,7 +36,7 @@ from multi_agent.embedding import get_embeddings
 from multi_agent.vector_db import get_vector_store
 from multi_agent.bm25 import create_bm25
 from multi_agent.llm import get_llm
-from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools
+from multi_agent.multi_agent_graph import build_multi_agent_graph, extract_answer, load_mcp_tools, mcp_status
 
 from langgraph.store.memory import InMemoryStore
 
@@ -73,12 +74,52 @@ app.add_middleware(
     allow_headers=["*"],#允许前端所有请求头
 )
 
+# ========== 鉴权 ==========
+# CORS 不是认证：它只约束浏览器，curl / requests 直接打 :8000 完全绕开。
+# 不设防的话谁都能上传 PDF、跑 Agent、烧你的 token —— 所以加一层 API Key。
+# 配置：.env 里设 BACKEND_API_KEY=xxx（前端读同一变量，见 app.py）；
+#       docker-compose 已把它透传给两个容器。
+# 没设怎么办：按开发模式放行，但启动时打一条 WARNING。
+#   为什么不直接启动失败：这个项目要能 docker-compose up 就起来给面试官点开。
+#   但警告必须显式——绝不能让人"以为有鉴权其实没有"。
+API_KEY = os.getenv("BACKEND_API_KEY", "").strip()
+if not API_KEY:
+    logger.warning("未设置 BACKEND_API_KEY —— 接口无鉴权，仅限本地开发；部署环境务必设置")
+
+
+async def verify_api_key(
+    authorization: str = Header(default=""),
+    x_api_key: str = Header(default=""),
+):
+    """校验 API Key。同时接受 `Authorization: Bearer <key>` 和 `X-API-Key: <key>`。
+
+    健康检查故意不挂这个依赖：探活（k8s / 负载均衡器）不会带凭证。
+    """
+    if not API_KEY:            # 开发模式：没配置就不校验
+        return
+
+    token = ""
+    if authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+    elif x_api_key:
+        token = x_api_key.strip()
+
+    # 用 compare_digest 而不是 ==：== 在第一个不同字符处就返回，
+    # 攻击者能靠响应时间逐字节试出 Key（定时攻击）。compare_digest 是常量时间。
+    if not token or not secrets.compare_digest(token, API_KEY):
+        raise HTTPException(
+            status_code=401,
+            detail="缺少或错误的 API Key",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+
+
 # ========== 会话管理 ==========
 # 每个用户（session_id）对应一套独立的知识库和 graph
 # 生产环境用 Redis —— session_store 把重物落盘 + 元数据进 Redis，重启不丢、多进程共享。
 # 内存里只留最近用过的 graph 缓存（session_store 内部 LRU，最多 20 个）。
 from streamlit_1.session_store import (
-    save_session, get_session, delete_session, active_session_count,
+    save_session, get_session, delete_session, redis_status, SESSIONS_DIR,
 )
 
 
@@ -118,7 +159,7 @@ MAX_TOTAL_SIZE = 50 * 1024 * 1024  # 单次上传总量上限 50MB
 
 # ========== 接口 1：上传 PDF + 建索引 ==========
 
-@app.post("/api/upload-pdf")
+@app.post("/api/upload-pdf", dependencies=[Depends(verify_api_key)])
 async def upload_pdf(
     files: list[UploadFile] = File(...),
     domain: str = Form("general"),
@@ -246,7 +287,7 @@ async def upload_pdf(
 
 # ========== 接口 2：流式对话（核心） ==========
 
-@app.post("/api/chat-stream")
+@app.post("/api/chat-stream", dependencies=[Depends(verify_api_key)])
 async def chat_stream(req: ChatRequest):
     """
     流式对话接口，返回 SSE（Server-Sent Events）。
@@ -333,8 +374,41 @@ async def chat_stream(req: ChatRequest):
 # ========== 接口 3：健康检查 ==========
 
 @app.get("/api/health")
-async def health():
+async def health(response: Response):
+    """逐个探测依赖，如实报告是谁挂了。
+
+    设计取舍：
+      · 不鉴权 —— 探活方（k8s liveness/readiness、Docker healthcheck、负载均衡）
+        手里没有凭据，要鉴权的话探针永远是 401，探测就失去意义。
+      · 状态码分两档 —— Redis 是硬依赖（会话元数据全在里面），挂了返 503，
+        让编排系统把流量摘走；MCP 只是工具降级（连不上会退回纯本地检索），
+        标 degraded 但仍是 200，不该因为一个可选组件把整个服务判死。
+      · 探测函数自己吞异常并返回状态 —— 健康检查的职责是"报告"，把异常抛出去
+        调用方只会拿到 500 堆栈，看不出到底哪个组件出问题。
+    """
+    checks = {
+        "redis": await asyncio.to_thread(redis_status),  # ping 是阻塞网络 IO，别占事件循环
+        "session_dir": (
+            {"status": "ok", "path": str(SESSIONS_DIR)}
+            if SESSIONS_DIR.exists()
+            else {"status": "error", "detail": f"目录不存在：{SESSIONS_DIR}"}
+        ),
+        "mcp": mcp_status(),          # 只读全局状态，不主动拉起子进程
+        "checkpointer": {"status": "ok" if checkpointer else "disabled"},
+    }
+
+    overall = "ok"
+    if checks["redis"]["status"] != "ok" or checks["session_dir"]["status"] != "ok":
+        overall = "error"
+    elif checks["mcp"]["status"] == "error":
+        # not_started 不算降级：MCP 是懒加载的，没人传过该领域的 PDF 就还没拉起来，
+        # 这是正常初始态；只有明确报 error（上下文在但 session 是空的）才是真降级。
+        overall = "degraded"
+
+    response.status_code = 503 if overall == "error" else 200
     return {
-        "status": "ok",
-        "active_sessions": active_session_count(),
+        "status": overall,
+        "checks": checks,
+        # 会话数挂在外层图省事，前端/脚本一眼能看到；Redis 挂了就没有这个字段
+        "active_sessions": checks["redis"].get("active_sessions"),
     }

@@ -223,6 +223,20 @@ async def close_mcp():
         _mcp_ctx = None
 
 
+def mcp_status() -> dict:
+    """给健康检查用：只读地报告全局 MCP 子进程状态，不触发初始化。
+
+    特意不做主动 ping：探活接口不该有副作用——不能因为被探活就把子进程拉起来。
+    所以这里只回答"有没有常驻会话"。MCP 是可选依赖：真连不上时 Researcher
+    会退回纯本地检索工具，主流程不受影响，所以它挂了只算降级、不算故障。
+    """
+    if _mcp_ctx is None:
+        return {"status": "not_started"}   # 惰性启动：还没人上传过 PDF，属正常
+    if _mcp_ctx.get("session") is None:
+        return {"status": "error", "detail": "MCP 上下文存在但 session 为空"}
+    return {"status": "connected"}
+
+
 async def load_mcp_tools(domain: str = "general"):
     """
     加载指定领域允许使用的 MCP 工具（LangChain 工具列表）。

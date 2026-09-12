@@ -199,3 +199,16 @@ def delete_session(session_id):
 
 def active_session_count() -> int:
     return r.scard("session:index")
+
+
+def redis_status() -> dict:
+    """给健康检查用：真实 ping 一次 Redis，顺带带回会话数。
+
+    探测失败不往外抛异常，只如实返回状态——健康检查的职责是"报告哪个依赖挂了"，
+    抛出去的话探活方只会拿到一个 500 堆栈，看不出是谁的问题。
+    """
+    try:
+        r.ping()
+        return {"status": "ok", "active_sessions": active_session_count()}
+    except Exception as e:
+        return {"status": "error", "detail": f"{type(e).__name__}: {e}"}

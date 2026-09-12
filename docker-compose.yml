@@ -31,6 +31,16 @@ services:
       - /mnt/d/AI_CACHE/huggingface:/hf_cache         # 复用 D 盘已下载的模型，不重复下载
     ports:
       - "8000:8000"
+    healthcheck:
+      # /api/health 会真去 ping Redis、看索引目录、读 MCP 状态；
+      # Redis 挂了它返 503，这里就跟着 unhealthy，编排系统能把流量摘走。
+      # 为什么用 python 而不是 curl：backend 镜像里没装 curl，python 一定有。
+      # urlopen 遇到非 2xx 会抛异常，所以"没抛"就等于 200，不用再判一次状态码。
+      test: ["CMD", "python", "-c", "import sys,urllib.request\ntry: urllib.request.urlopen('http://localhost:8000/api/health', timeout=5)\nexcept Exception: sys.exit(1)\nsys.exit(0)"]
+      interval: 15s
+      timeout: 10s
+      retries: 3
+      start_period: 40s               # 启动要加载模型，别没起来就判死
     depends_on:
       redis:
         condition: service_healthy
@@ -42,6 +52,10 @@ services:
     restart: unless-stopped
     environment:
       - BACKEND_URL=http://backend:8000   # compose 服务名在容器网络里就是域名
+      # 后端开了鉴权时，前端得拿同一个 Key 才能调通。
+      # 后端那边的同名变量由 env_file: .env 注入，这里单独给前端补一份。
+      # ${VAR:-} 的默认空值：没配就传空串，前后端行为一致（都不校验收发）。
+      - BACKEND_API_KEY=${BACKEND_API_KEY:-}
     ports:
       - "8501:8501"
     depends_on:

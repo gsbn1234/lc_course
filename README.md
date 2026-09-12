@@ -250,7 +250,39 @@ DEEPSEEK_API_KEY=你的DeepSeekKey
 TAVILY_API_KEY=你的TavilyKey
 LANGSMITH_API_KEY=可选
 LANGSMITH_TRACING=false
+BACKEND_API_KEY=可选，见下
 ```
+
+**`BACKEND_API_KEY`（后端接口鉴权）**
+
+CORS 只约束浏览器，`curl` / `requests` 直接打 `:8000` 是绕得过去的，所以接口另加一层 API Key：
+
+- **留空** = 不校验（本地开发默认）。后端启动时会打一条 WARNING 提醒，仅限本机使用。
+- **填了值** = 两个上传/对话接口都要求带上这个 Key，校验走 `secrets.compare_digest`（常量时间比较，防时序侧信道）。请求头两种写法都认：
+  ```bash
+  curl -H "Authorization: Bearer $BACKEND_API_KEY" ...
+  curl -H "X-API-Key: $BACKEND_API_KEY" ...
+  ```
+  缺 Key 或 Key 错误统一返回 `401`。
+- 前端 `streamlit_1/app.py` 读的是**同一个变量名**，`docker-compose.yml` 里已给 frontend 服务注入，本地跑时两个进程都要能看到这个变量（同一个 `.env` 即可）。
+
+`GET /api/health` **不需要鉴权**——探活方（Docker healthcheck、k8s 探针、负载均衡）手里没有凭据，要鉴权的话探针永远是 401。它逐个报告依赖：
+
+```json
+{
+  "status": "ok",                       // ok | degraded | error
+  "checks": {
+    "redis":        {"status": "ok", "active_sessions": 3},
+    "session_dir":  {"status": "ok", "path": "faiss_db/sessions"},
+    "mcp":          {"status": "not_started"},
+    "checkpointer": {"status": "ok"}
+  },
+  "active_sessions": 3
+}
+```
+
+- Redis 或索引目录出问题 → `status: "error"`，HTTP **503**（硬依赖挂了，该把流量摘走）。
+- 只有 MCP 出问题 → `status: "degraded"`，HTTP 仍是 **200**（工具降级会自动退回纯本地检索，不该因此把整个服务判死）。`not_started` 是懒加载的正常初始态，不算降级。
 
 ### 3. 启用 LangSmith 追踪（可选）
 
