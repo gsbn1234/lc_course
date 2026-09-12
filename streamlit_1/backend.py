@@ -10,6 +10,7 @@ FastAPI 后端 — 把 Multi-Agent 系统封装成 REST API。
   Streamlit 前端 ↔ FastAPI 后端 ↔ LangGraph Agent-RAG 核心
 """
 
+import asyncio #事件循环里不能跑同步阻塞活：用 asyncio.to_thread 把它丢进线程池，期间事件循环继续处理别的请求
 import os
 import shutil #用于递归清理临时目录（try/finally 保证出错也会删干净）
 
@@ -138,41 +139,52 @@ async def upload_pdf(
     # 2. 生成会话 ID
     session_id = str(uuid.uuid4())[:8]
 
-    # 3. 保存到临时目录并加载 PDF。
-    #    try/finally：无论建索引是否抛错，临时目录都保证被清理，不残留垃圾文件。
-    temp_dir = tempfile.mkdtemp()
+    # 3+4. 落盘临时文件 + 解析 PDF。
+    #      写盘和 PyPDF 解析都是同步阻塞（磁盘 IO + CPU），直接写在 async 函数里
+    #      会把事件循环占死——上传期间别人的 /api/health、对话请求全部排队。
+    #      所以整段封成同步函数丢进线程池，事件循环立刻空出来接别的请求。
+    #      try/finally 保证临时目录必删，不残留垃圾文件。
+    def _save_and_parse(blobs):
+        temp_dir = tempfile.mkdtemp()
+        try:
+            saved_paths = []
+            for filename, content in blobs:
+                # 用 uuid 前缀重命名，彻底避免同名文件互相覆盖
+                safe_name = f"{uuid.uuid4().hex[:8]}_{filename}"
+                file_path = os.path.join(temp_dir, safe_name)
+                with open(file_path, "wb") as f_out:
+                    f_out.write(content)
+                saved_paths.append(file_path)
+
+            parsed = []
+            for file_path in saved_paths:
+                parsed.extend(PyPDFLoader(file_path).load())
+            return parsed
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+    docs = await asyncio.to_thread(_save_and_parse, file_blobs)
+
     try:
-        saved_paths = []
-        for filename, content in file_blobs:
-            # 用 uuid 前缀重命名，彻底避免同名文件互相覆盖
-            safe_name = f"{uuid.uuid4().hex[:8]}_{filename}"
-            file_path = os.path.join(temp_dir, safe_name)
-            with open(file_path, "wb") as f_out:
-                f_out.write(content)
-            saved_paths.append(file_path)
+        # 5+6. 切分 + 建索引：这是全流程最重的同步部分——
+        #      jieba 分词是纯 CPU（首次调用还要加载词典），
+        #      FAISS.from_documents 更重：要为每个 chunk 同步发一次 embedding 网络请求。
+        #      整段一起丢线程池，不切碎（避免多次线程切换的开销）。
+        def _build_index():
+            child, parent = split_parent_child(
+                docs, child_size=200, parent_size=800, overlap=50
+            )
+            embs = get_embeddings()
+            # use_cache=False：上传必须基于新文档强制重建索引，
+            # 不能复用全局 faiss_db/ 里的旧索引（否则每个会话共享同一份旧库）
+            vs = get_vector_store(child, embs, use_cache=False)
+            return child, parent, vs, create_bm25(child)
 
-        # 4. 加载 PDF
-        docs = []
-        for file_path in saved_paths:
-            loader = PyPDFLoader(file_path)
-            docs.extend(loader.load())
-    finally:
-        shutil.rmtree(temp_dir, ignore_errors=True)
-
-    try:
-        # 5. 父子切分
-        child_docs, parent_docs = split_parent_child(
-            docs, child_size=200, parent_size=800, overlap=50
-        )
-
-        # 6. 建索引
-        embeddings = get_embeddings()
-        # use_cache=False：上传必须基于新文档强制重建索引，
-        # 不能复用全局 faiss_db/ 里的旧索引（否则每个会话共享同一份旧库）
-        vector_store = get_vector_store(child_docs, embeddings, use_cache=False)
-        bm25 = create_bm25(child_docs)
+        child_docs, parent_docs, vector_store, bm25 = await asyncio.to_thread(_build_index)
 
         # 7. 构建 Agent 图
+        #    这一步留在线程池外：build_multi_agent_graph 只编译图结构（建节点/连边），
+        #    不做 IO；真正耗时的 MCP 工具加载本身已经是异步的（await load_mcp_tools）。
         llm = get_llm()
         mcp_tools = await load_mcp_tools(domain)  # 按领域加载 MCP 工具（全局复用客户端）
         graph = build_multi_agent_graph(
@@ -188,15 +200,22 @@ async def upload_pdf(
         raise HTTPException(status_code=500, detail=f"索引构建失败：{type(e).__name__}: {e}")
 
     # 8. 存进会话：重物落盘 + 元数据进 Redis + 内存缓存（三层，见 session_store）
-    save_session(session_id, {
-        "vector_store": vector_store,
-        "bm25": bm25,
-        "chunks": child_docs,
-        "parent_docs": parent_docs,
-        "graph": graph,
-        "llm": llm,
-        "domain": domain,   # 存领域，会话恢复时按它重新加载对应 MCP 工具
-    }, page_count=len(docs))
+    #    save_session 是同步函数（把 FAISS 索引 + 两个 JSON 写磁盘，再发 Redis 请求），
+    #    大索引落盘是实打实的磁盘 IO，同样丢线程池，不占事件循环。
+    await asyncio.to_thread(
+        save_session,
+        session_id,
+        {
+            "vector_store": vector_store,
+            "bm25": bm25,
+            "chunks": child_docs,
+            "parent_docs": parent_docs,
+            "graph": graph,
+            "llm": llm,
+            "domain": domain,   # 存领域，会话恢复时按它重新加载对应 MCP 工具
+        },
+        len(docs),
+    )
 
     return {
         "session_id": session_id,

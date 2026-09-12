@@ -24,10 +24,12 @@ Redis 会话存储 — 替代 backend.py 里的内存 sessions dict。
   FAISS 索引自身的二进制序列化，它要求 allow_dangerous_deserialization=True，
   信任边界：这些文件只由本应用写入。
 """
+import asyncio   # 阻塞的读盘/重建操作丢线程池，别占事件循环
 import json
 import logging
 import os
 import pickle  # 仅用于兼容旧会话 .pkl 的迁移读取
+import threading # 重建跑在线程池里，缓存就成了跨线程共享状态，写入要加锁
 from collections import OrderedDict
 from datetime import datetime
 from pathlib import Path
@@ -56,6 +58,7 @@ except redis.ConnectionError:
 SESSIONS_DIR = Path("faiss_db/sessions")  # 会话索引都放这里（faiss_db 已在 .gitignore）
 MAX_CACHED = 20                            # 内存最多缓存多少个重建好的会话
 _cache: OrderedDict = OrderedDict()        # session_id -> 重建好的会话字典
+_cache_lock = threading.Lock()             # 保护 _cache 的写入+淘汰（线程池并发调用时）
 
 
 def _key(session_id: str) -> str:
@@ -63,10 +66,11 @@ def _key(session_id: str) -> str:
 
 
 def _cache_put(session_id, session):
-    _cache[session_id] = session
-    _cache.move_to_end(session_id)
-    while len(_cache) > MAX_CACHED:
-        _cache.popitem(last=False)  # 淘汰最久没用的
+    with _cache_lock:
+        _cache[session_id] = session
+        _cache.move_to_end(session_id)
+        while len(_cache) > MAX_CACHED:
+            _cache.popitem(last=False)  # 淘汰最久没用的
 
 
 def _docs_to_json(docs) -> str:
@@ -122,15 +126,18 @@ async def get_session(session_id, checkpointer=None, store=None):
     return await _rebuild(session_id, checkpointer, store)
 
 
-async def _rebuild(session_id, checkpointer, store):
-    """从磁盘重建一个会话：FAISS + chunks + bm25 + 重编 graph。"""
+def _rebuild_sync(session_id):
+    """重建里所有阻塞的部分：读盘 + FAISS 加载 + jieba 分词。
+
+    抽成同步函数是给 asyncio.to_thread 用的——这些操作直接写在 async 函数里
+    会把事件循环占死（重启后第一次提问最明显，那时候所有会话都要走这条路）。
+    返回 None 表示会话索引不在磁盘上。
+    """
     session_dir = SESSIONS_DIR / session_id
     index_dir = session_dir / "faiss_index"
     if not index_dir.exists():
         return None
 
-    # 重启后第一次提问能看到这行，证明走的是"磁盘重建"路径而不是内存缓存
-    logger.info("从磁盘重建会话 %s", session_id)
     embeddings = get_embeddings()
     vector_store = FAISS.load_local(
         str(index_dir), embeddings, allow_dangerous_deserialization=True
@@ -138,6 +145,22 @@ async def _rebuild(session_id, checkpointer, store):
     chunks = _load_docs(session_dir / "chunks.json", session_dir / "chunks.pkl")
     parent_docs = _load_docs(session_dir / "parent_docs.json", session_dir / "parent_docs.pkl")
     bm25 = create_bm25(chunks)   # 原 FileNotFoundError 兜底升级成唯一路径，不再落盘
+    return vector_store, chunks, parent_docs, bm25
+
+
+async def _rebuild(session_id, checkpointer, store):
+    """从磁盘重建一个会话：FAISS + chunks + bm25 + 重编 graph。
+
+    阻塞的读盘/分词丢线程池；留在事件循环上的只有 MCP 加载（本身就是异步）
+    和图编译（纯内存建节点连边，不做 IO）。
+    """
+    loaded = await asyncio.to_thread(_rebuild_sync, session_id)
+    if loaded is None:
+        return None
+    vector_store, chunks, parent_docs, bm25 = loaded
+
+    # 重启后第一次提问能看到这行，证明走的是"磁盘重建"路径而不是内存缓存
+    logger.info("从磁盘重建会话 %s", session_id)
 
     # MCP 工具按会话的领域加载（domain 存在 Redis 元数据里），
     # 连不上就退回纯本地工具，不影响使用
